@@ -78,6 +78,12 @@ describe('Include-First Path Resolver & SQLite WAL Stager', () => {
       assert.equal(isExcluded('logs/output.log'), true);
       assert.equal(isExcluded('mnemosyne/logs/agent.log'), true);
 
+      // skills/.hub/ internal registry cache
+      assert.equal(isExcluded('skills/.hub/index-cache/hermes-index.json'), true);
+      assert.equal(isExcluded('skills/.hub/scan-cache/scan.json'), true);
+      assert.equal(isExcluded('skills/.hub/lock.json'), true);
+      assert.equal(isExcluded('skills/.hub/audit.log'), true);
+
       // Git & OS metadata
       assert.equal(isExcluded('skills/my_skill/.git/config'), true);
       assert.equal(isExcluded('skills/my_skill/.DS_Store'), true);
@@ -157,6 +163,11 @@ describe('Include-First Path Resolver & SQLite WAL Stager', () => {
 
       await fs.promises.mkdir(path.join(mockHermesHome, 'skills/weather'), { recursive: true });
       await fs.promises.writeFile(path.join(mockHermesHome, 'skills/weather/SKILL.md'), 'weather skill');
+
+      // skills/.hub internal registry cache (must be excluded)
+      await fs.promises.mkdir(path.join(mockHermesHome, 'skills/.hub/index-cache'), { recursive: true });
+      await fs.promises.writeFile(path.join(mockHermesHome, 'skills/.hub/index-cache/hermes-index.json'), '{}');
+      await fs.promises.writeFile(path.join(mockHermesHome, 'skills/.hub/lock.json'), '{}');
 
       await fs.promises.mkdir(path.join(mockHermesHome, 'scripts'), { recursive: true });
       await fs.promises.writeFile(path.join(mockHermesHome, 'scripts/health.sh'), '#!/bin/bash');
@@ -250,6 +261,8 @@ describe('Include-First Path Resolver & SQLite WAL Stager', () => {
       assert.ok(!relativePaths.includes('node/bin/node'));
       assert.ok(!relativePaths.includes('logs/app.log'));
       assert.ok(!relativePaths.includes('cache/data.tmp'));
+      assert.ok(!relativePaths.includes('skills/.hub/index-cache/hermes-index.json'));
+      assert.ok(!relativePaths.includes('skills/.hub/lock.json'));
     });
 
     it('should handle circular symlinks safely without entering infinite loop', async () => {

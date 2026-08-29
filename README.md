@@ -110,6 +110,7 @@ The following paths and patterns are excluded from all backup archives:
 | `mnemosyne-venv/`                         | Python virtual environments                                      |
 | `node/` & `bin/`                          | Node.js runtimes and CLI binaries                                |
 | `cache/` & `logs/`                        | Transient runtime caches and raw log files                       |
+| `skills/.hub/`                            | Internal skill registry cache (index-cache, scan-cache, lock)     |
 | `mnemosyne/logs/`                         | Mnemosyne service logs                                           |
 | `*.lock`, `.fire-*`                       | Process locks and ephemeral trigger markers                      |
 | `ticker_heartbeat`, `ticker_last_success` | Transient cron health heartbeats                                 |
