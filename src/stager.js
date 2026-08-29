@@ -113,6 +113,11 @@ export function isExcluded(relativePath) {
     return true;
   }
 
+  // skills/.hub/ internal registry cache (index-cache, scan-cache, lock, audit)
+  if (segments.includes('skills') && segments.includes('.hub')) {
+    return true;
+  }
+
   // logs/ directory (root or subdirectories like mnemosyne/logs)
   if (segments.includes('logs')) {
     return true;
