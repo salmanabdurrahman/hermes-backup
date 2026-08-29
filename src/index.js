@@ -46,3 +46,16 @@ export {
   pruneExpiredBackups,
   formatBackupListTable,
 } from './storage.js';
+
+export {
+  DEFAULT_BREVO_API_ENDPOINT,
+  DEFAULT_SENDER_NAME,
+  DEFAULT_RECIPIENT_NAME,
+  escapeHtml,
+  formatErrorDetails,
+  buildFailureHtml,
+  buildTestHtml,
+  sendBrevoEmail,
+  sendFailureAlert,
+  sendTestNotification,
+} from './notifier.js';
