@@ -1,0 +1,44 @@
+{
+  "name": "hermes-backup",
+  "version": "1.0.0",
+  "description": "Automated selective backup CLI for Hermes Agent state to Cloudflare R2 with Brevo alerting",
+  "type": "module",
+  "main": "src/index.js",
+  "bin": {
+    "hermes-backup": "./cli.js"
+  },
+  "files": [
+    "src",
+    "cli.js"
+  ],
+  "scripts": {
+    "start": "node cli.js",
+    "test": "node --test test/**/*.test.js"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/salmanabdurrahman/hermes-backup.git"
+  },
+  "keywords": [
+    "hermes",
+    "backup",
+    "sqlite",
+    "wal",
+    "cloudflare-r2",
+    "brevo"
+  ],
+  "author": "Salman Abdurrahman",
+  "license": "MIT",
+  "bugs": {
+    "url": "https://github.com/salmanabdurrahman/hermes-backup/issues"
+  },
+  "homepage": "https://github.com/salmanabdurrahman/hermes-backup#readme",
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "dependencies": {
+    "@aws-sdk/client-s3": "^3.750.0",
+    "dotenv": "^16.4.7",
+    "tar": "^7.4.3"
+  }
+}
