@@ -37,6 +37,14 @@ describe('Config Loader & Validator', () => {
     assert.equal(config.r2.endpoint, 'https://custom.endpoint.example.com');
   });
 
+  it('should expand template variables in R2_ENDPOINT if present', () => {
+    const config = loadConfig({
+      R2_ACCOUNT_ID: 'abc123def456',
+      R2_ENDPOINT: 'https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com',
+    });
+    assert.equal(config.r2.endpoint, 'https://abc123def456.r2.cloudflarestorage.com');
+  });
+
   it('should load custom environment overrides properly', () => {
     const customEnv = {
       HERMES_HOME: '/custom/hermes/path',
@@ -141,6 +149,32 @@ describe('Config Loader & Validator', () => {
     assert.ok(result.errors.some((e) => e.includes('BREVO_RECIPIENT_EMAIL')));
     assert.ok(result.errors.some((e) => e.includes('BACKUP_RETENTION_DAYS')));
     assert.ok(result.errors.some((e) => e.includes('BACKUP_TEMP_DIR')));
+  });
+
+  it('should flag unresolved template variables in R2 endpoint or accountId', () => {
+    const configWithTemplates = {
+      hermesHome: '/home/salmanabd/.hermes',
+      r2: {
+        accountId: '${R2_ACCOUNT_ID}',
+        accessKeyId: 'key123',
+        secretAccessKey: 'sec123',
+        bucketName: 'hermes-backups',
+        endpoint: 'https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com',
+      },
+      brevo: {
+        apiKey: 'xkeysib-key',
+        senderName: 'Bot',
+        senderEmail: 'bot@example.com',
+        recipientEmail: 'user@example.com',
+      },
+      retentionDays: 3,
+      tempDir: '/tmp',
+    };
+
+    const result = validateConfig(configWithTemplates);
+    assert.equal(result.valid, false);
+    assert.ok(result.errors.some((e) => e.includes('R2_ENDPOINT contains unresolved template variables')));
+    assert.ok(result.errors.some((e) => e.includes('R2_ACCOUNT_ID contains unresolved template variables')));
   });
 
   it('should throw error when throwOnError option is set', () => {

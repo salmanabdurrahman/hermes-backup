@@ -23,7 +23,10 @@ export function isValidEmail(email) {
  */
 export function loadConfig(env = process.env) {
   const accountId = (env.R2_ACCOUNT_ID || '').trim();
-  const rawEndpoint = (env.R2_ENDPOINT || '').trim();
+  let rawEndpoint = (env.R2_ENDPOINT || '').trim();
+  if (rawEndpoint && rawEndpoint.includes('${')) {
+    rawEndpoint = rawEndpoint.replace(/\$\{([A-Za-z0-9_]+)\}/g, (_, k) => (env[k] || '').trim());
+  }
   const endpoint = rawEndpoint || (accountId ? `https://${accountId}.r2.cloudflarestorage.com` : '');
 
   const retentionDaysRaw = env.BACKUP_RETENTION_DAYS;
@@ -74,6 +77,12 @@ export function validateConfig(config, options = {}) {
     if (requireR2) {
       if (!config.r2?.accountId && !config.r2?.endpoint) {
         errors.push('R2_ACCOUNT_ID or R2_ENDPOINT must be specified');
+      }
+      if (config.r2?.endpoint && config.r2.endpoint.includes('${')) {
+        errors.push('R2_ENDPOINT contains unresolved template variables (${...})');
+      }
+      if (config.r2?.accountId && config.r2.accountId.includes('${')) {
+        errors.push('R2_ACCOUNT_ID contains unresolved template variables (${...})');
       }
       if (!config.r2?.accessKeyId) {
         errors.push('R2_ACCESS_KEY_ID must be specified');

@@ -1,12 +1,14 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
+import https from 'node:https';
 import {
   S3Client,
   PutObjectCommand,
   ListObjectsV2Command,
   DeleteObjectsCommand,
 } from '@aws-sdk/client-s3';
+import { NodeHttpHandler } from '@smithy/node-http-handler';
 import { validateConfig } from './config.js';
 import { createSanitizer } from './sanitizer.js';
 
@@ -46,9 +48,18 @@ export function formatBytes(bytes, decimals = 2) {
 export function createR2Client(config, clientOverrides = {}) {
   validateConfig(config, { requireR2: true, requireBrevo: false, throwOnError: true });
 
+  const httpsAgent = new https.Agent({
+    keepAlive: true,
+    maxSockets: 50,
+  });
+
   const clientConfig = {
     region: 'auto',
     endpoint: config.r2.endpoint,
+    forcePathStyle: true,
+    requestHandler: new NodeHttpHandler({
+      httpsAgent,
+    }),
     credentials: {
       accessKeyId: config.r2.accessKeyId,
       secretAccessKey: config.r2.secretAccessKey,

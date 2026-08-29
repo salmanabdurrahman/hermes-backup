@@ -169,7 +169,8 @@ R2_ACCOUNT_ID=your_cloudflare_account_id
 R2_ACCESS_KEY_ID=your_r2_access_key_id
 R2_SECRET_ACCESS_KEY=your_r2_secret_access_key
 R2_BUCKET_NAME=hermes-backups
-R2_ENDPOINT=https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com
+# Optional: Auto-derived as https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com when omitted
+R2_ENDPOINT=https://your_cloudflare_account_id.r2.cloudflarestorage.com
 
 # Brevo (Sendinblue) Transactional Email Alerting
 BREVO_API_KEY=your_brevo_api_key
@@ -433,6 +434,11 @@ Verify that Hermes Agent successfully starts and loads long-term memories.
 
 - **Cause**: Multiple large simultaneous backups or limited temp partition.
 - **Fix**: Configure `BACKUP_TEMP_DIR` in `.env` to point to a partition with adequate free storage (e.g., `BACKUP_TEMP_DIR=/var/tmp`).
+
+### 6. `SSL alert number 40` / `ssl/tls alert handshake failure`
+
+- **Cause**: Unresolved `${R2_ACCOUNT_ID}` placeholder in `R2_ENDPOINT` causing requests to target an invalid hostname, or virtual-hosted bucket style addressing.
+- **Fix**: Leave `R2_ENDPOINT` blank in `.env` (it will auto-derive from `R2_ACCOUNT_ID`), or ensure `R2_ENDPOINT` contains your explicit Account ID without unexpanded syntax.
 
 ## Testing & Verification
 
