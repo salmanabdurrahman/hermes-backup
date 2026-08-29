@@ -59,3 +59,16 @@ export {
   sendFailureAlert,
   sendTestNotification,
 } from './notifier.js';
+
+export {
+  CLI_VERSION,
+  COMMANDS,
+  HELP_TEXT,
+  parseCliArgs,
+  printHelp,
+  printVersion,
+  backupCommand,
+  testNotifyCommand,
+  listCommand,
+  runCli,
+} from './cli.js';

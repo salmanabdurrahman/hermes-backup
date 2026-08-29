@@ -199,7 +199,7 @@ export async function sendBrevoEmail(payload, config, options = {}) {
   const sanitizer = createSanitizer(config);
 
   try {
-    validateConfig(config, { requireR2: false, requireBrevo: true, throwOnError: true });
+    validateConfig(config, { requireR2: false, requireBrevo: !dryRun, throwOnError: true });
   } catch (err) {
     const sanitizedError = sanitizer(err);
     if (throwOnError) throw sanitizedError;
@@ -225,8 +225,8 @@ export async function sendBrevoEmail(payload, config, options = {}) {
   }
 
   const sender = payload.sender || {
-    name: config.brevo.senderName || DEFAULT_SENDER_NAME,
-    email: config.brevo.senderEmail,
+    name: config?.brevo?.senderName || DEFAULT_SENDER_NAME,
+    email: config?.brevo?.senderEmail || (dryRun ? 'dry-run-sender@example.com' : ''),
   };
 
   if (!sender.email || !isValidEmail(sender.email)) {
@@ -237,10 +237,11 @@ export async function sendBrevoEmail(payload, config, options = {}) {
 
   const to = payload.to || [
     {
-      email: config.brevo.recipientEmail,
+      email: config?.brevo?.recipientEmail || (dryRun ? 'dry-run-recipient@example.com' : ''),
       name: DEFAULT_RECIPIENT_NAME,
     },
   ];
+
 
   if (!Array.isArray(to) || to.length === 0) {
     const error = new Error('Email recipient list (to) must contain at least one recipient');
