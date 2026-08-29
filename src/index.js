@@ -36,3 +36,13 @@ export {
   registerProcessCleanup,
   withStagingCleanup,
 } from './archiver.js';
+
+export {
+  BACKUP_FILE_REGEX,
+  formatBytes,
+  createR2Client,
+  uploadBackup,
+  listBackups,
+  pruneExpiredBackups,
+  formatBackupListTable,
+} from './storage.js';
