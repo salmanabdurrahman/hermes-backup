@@ -25,3 +25,14 @@ export {
   cleanStagingDirectory,
   stageBackup,
 } from './stager.js';
+
+export {
+  generateArchiveName,
+  createArchive,
+  createArchiveStream,
+  validateArchive,
+  cleanupArchive,
+  cleanupTempResources,
+  registerProcessCleanup,
+  withStagingCleanup,
+} from './archiver.js';
