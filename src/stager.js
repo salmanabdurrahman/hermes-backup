@@ -2,6 +2,10 @@ import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import crypto from 'node:crypto';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
+
+const execFileAsync = promisify(execFile);
 
 /**
  * Priority 1 (Mandatory) whitelist items relative to HERMES_HOME.
@@ -33,6 +37,7 @@ export const RECOMMENDED_WHITELIST = Object.freeze([
   'context_length_cache.yaml',
   'channel_directory.json',
   '.skills_prompt_snapshot.json',
+  'state.db',
 ]);
 
 /**
@@ -65,9 +70,8 @@ export function isExcluded(relativePath) {
   const basename = path.posix.basename(normalized);
   const segments = normalized.split('/');
 
-  // state.db and its companion files
+  // state.db companion files (state.db is captured atomically via SQLite online backup)
   if (
-    basename === 'state.db' ||
     basename === 'state.db-wal' ||
     basename === 'state.db-shm' ||
     basename === 'state.db-journal'
@@ -155,6 +159,10 @@ export function isExcluded(relativePath) {
 export function getSqliteCompanionPaths(relativePath) {
   const normalized = normalizePath(relativePath);
   if (!normalized.toLowerCase().endsWith('.db')) {
+    return [];
+  }
+  // state.db is captured as a self-contained snapshot via SQLite online backup; companion files are not staged
+  if (path.posix.basename(normalized) === 'state.db') {
     return [];
   }
   return [
@@ -532,6 +540,31 @@ export async function cleanStagingDirectory(stagingDir, tempDir = '/tmp') {
 }
 
 /**
+ * Stages a live SQLite database file using atomic online backup (.backup command)
+ * to guarantee transaction consistency and flush active WAL data.
+ * Falls back to standard copyFile if sqlite3 CLI is unavailable or errors.
+ *
+ * @param {string} sourcePath - Absolute path to source SQLite database
+ * @param {string} destPath - Absolute path to destination backup file
+ * @returns {Promise<void>}
+ */
+export async function stageLiveSqliteDatabase(sourcePath, destPath) {
+  try {
+    const escapedDest = destPath.replace(/"/g, '\\"');
+    await execFileAsync('sqlite3', [sourcePath, `.backup "${escapedDest}"`]);
+    const stat = await fs.promises.stat(destPath);
+    if (stat.size === 0) {
+      const srcStat = await fs.promises.stat(sourcePath);
+      if (srcStat.size > 0) {
+        throw new Error('sqlite3 .backup produced an empty file from non-empty source');
+      }
+    }
+  } catch {
+    await fs.promises.copyFile(sourcePath, destPath);
+  }
+}
+
+/**
  * Stages backup files from HERMES_HOME into an isolated staging directory.
  * Preserves relative directory hierarchy and copies SQLite WAL/SHM files.
  *
@@ -591,7 +624,12 @@ export async function stageBackup(hermesHome, options = {}) {
       const destDir = path.dirname(destPath);
 
       await fs.promises.mkdir(destDir, { recursive: true });
-      await fs.promises.copyFile(file.absolutePath, destPath);
+
+      if (path.posix.basename(file.relativePath) === 'state.db') {
+        await stageLiveSqliteDatabase(file.absolutePath, destPath);
+      } else {
+        await fs.promises.copyFile(file.absolutePath, destPath);
+      }
 
       const stagedStat = await fs.promises.stat(destPath);
 

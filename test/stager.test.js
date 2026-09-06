@@ -48,7 +48,7 @@ describe('Include-First Path Resolver & SQLite WAL Stager', () => {
 
     it('should identify safety-net excluded paths accurately', () => {
       // state.db
-      assert.equal(isExcluded('state.db'), true);
+      assert.equal(isExcluded('state.db'), false);
       assert.equal(isExcluded('state.db-wal'), true);
       assert.equal(isExcluded('state.db-shm'), true);
       assert.equal(isExcluded('state.db-journal'), true);
@@ -120,6 +120,7 @@ describe('Include-First Path Resolver & SQLite WAL Stager', () => {
 
       assert.deepEqual(getSqliteCompanionPaths('config.yaml'), []);
       assert.deepEqual(getSqliteCompanionPaths('MEMORIES.md'), []);
+      assert.deepEqual(getSqliteCompanionPaths('state.db'), []);
     });
 
     it('should format backup timestamp correctly', () => {
@@ -246,13 +247,13 @@ describe('Include-First Path Resolver & SQLite WAL Stager', () => {
       assert.ok(relativePaths.includes('context_length_cache.yaml'));
       assert.ok(relativePaths.includes('channel_directory.json'));
       assert.ok(relativePaths.includes('.skills_prompt_snapshot.json'));
+      assert.ok(relativePaths.includes('state.db'));
 
       // Verify exclusions
       assert.ok(!relativePaths.includes('cron/job.lock'));
       assert.ok(!relativePaths.includes('cron/.fire-job-1'));
       assert.ok(!relativePaths.includes('cron/ticker_heartbeat'));
       assert.ok(!relativePaths.includes('cron/ticker_last_success'));
-      assert.ok(!relativePaths.includes('state.db'));
       assert.ok(!relativePaths.includes('state.db-wal'));
       assert.ok(!relativePaths.includes('hermes-agent/app.js'));
       assert.ok(!relativePaths.includes('backups/backup-2026.zip'));
@@ -448,6 +449,50 @@ describe('Include-First Path Resolver & SQLite WAL Stager', () => {
       assert.ok(queryResult2.includes('daily_sync|success'));
 
       // Clean staging
+      await cleanStagingDirectory(stageResult.stagingDir, testTempDir);
+    });
+
+    it('should stage state.db atomically via sqlite3 online backup without companion files', async () => {
+      const stateDbPath = path.join(mockHermesHome, 'state.db');
+      execFileSync('sqlite3', [
+        stateDbPath,
+        `
+        PRAGMA journal_mode = WAL;
+        CREATE TABLE sessions (id TEXT PRIMARY KEY, model TEXT);
+        CREATE TABLE messages (id INTEGER PRIMARY KEY, content TEXT);
+        INSERT INTO sessions (id, model) VALUES ('sess_001', 'openai/gpt-5.6-luna');
+        INSERT INTO messages (id, content) VALUES (1, 'Hello from Telegram');
+        `,
+      ]);
+
+      // Create dummy WAL and SHM to ensure companions are excluded from staging
+      await fs.promises.writeFile(`${stateDbPath}-wal`, 'active-wal-data');
+      await fs.promises.writeFile(`${stateDbPath}-shm`, 'active-shm-data');
+
+      const stageResult = await stageBackup(mockHermesHome, { tempDir: testTempDir });
+      assert.ok(stageResult.stagingDir);
+
+      const stagedStateDb = path.join(stageResult.stagingDir, 'state.db');
+      assert.ok(fs.existsSync(stagedStateDb));
+
+      // Companions must NOT be staged
+      assert.ok(!fs.existsSync(path.join(stageResult.stagingDir, 'state.db-wal')));
+      assert.ok(!fs.existsSync(path.join(stageResult.stagingDir, 'state.db-shm')));
+
+      // Integrity of staged database must pass
+      const integrityCheck = execFileSync('sqlite3', [stagedStateDb, 'PRAGMA integrity_check;'], {
+        encoding: 'utf8',
+      }).trim();
+      assert.equal(integrityCheck, 'ok');
+
+      // Verify data integrity
+      const queryResult = execFileSync(
+        'sqlite3',
+        [stagedStateDb, 'SELECT s.model, m.content FROM sessions s JOIN messages m ON 1=1;'],
+        { encoding: 'utf8' }
+      ).trim();
+      assert.ok(queryResult.includes('openai/gpt-5.6-luna|Hello from Telegram'));
+
       await cleanStagingDirectory(stageResult.stagingDir, testTempDir);
     });
   });

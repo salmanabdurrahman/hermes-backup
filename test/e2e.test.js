@@ -13,6 +13,7 @@ import {
   listCommand,
   loadConfig,
   formatBytes,
+  formatBackupTimestamp,
 } from '../src/index.js';
 
 const execFileAsync = promisify(execFile);
@@ -248,14 +249,14 @@ describe('End-to-End Integration Test Suite & Mock VPS Validation', () => {
       'sqlite-snapshot-backup-data'
     );
 
-    // 14. Context cache, channel directory, prompt snapshot
+    // 14. Context cache, channel directory, prompt snapshot, state db
     await fs.promises.writeFile(path.join(targetHome, 'context_length_cache.yaml'), 'claude: 200000\n');
     await fs.promises.writeFile(path.join(targetHome, 'channel_directory.json'), '{"channels":[]}');
     await fs.promises.writeFile(path.join(targetHome, '.skills_prompt_snapshot.json'), '{"skills":[]}');
+    await fs.promises.writeFile(path.join(targetHome, 'state.db'), 'state-db-data');
 
     // --- Safety-Net Excluded Files (Must NOT be included in backup) ---
-    // State db (cache)
-    await fs.promises.writeFile(path.join(targetHome, 'state.db'), 'large-state-cache-data');
+    // State db companions (excluded; atomic backup handles state.db)
     await fs.promises.writeFile(path.join(targetHome, 'state.db-wal'), 'large-state-wal');
     await fs.promises.writeFile(path.join(targetHome, 'state.db-shm'), 'large-state-shm');
 
@@ -329,6 +330,14 @@ describe('End-to-End Integration Test Suite & Mock VPS Validation', () => {
       const io = createMockIo();
       const config = createTestConfig();
 
+      const oneDayAgo = new Date(Date.now() - 1 * 24 * 60 * 60 * 1000);
+      const fiveDaysAgo = new Date(Date.now() - 5 * 24 * 60 * 60 * 1000);
+      const tenDaysAgo = new Date(Date.now() - 10 * 24 * 60 * 60 * 1000);
+
+      const freshKey = `backups/hermes-backup-${formatBackupTimestamp(oneDayAgo)}.tar.gz`;
+      const expired5Key = `backups/hermes-backup-${formatBackupTimestamp(fiveDaysAgo)}.tar.gz`;
+      const expired10Key = `backups/hermes-backup-${formatBackupTimestamp(tenDaysAgo)}.tar.gz`;
+
       let uploadedPayloadBuffer = null;
       let putObjectCommandCaptured = null;
       let deleteObjectsCommandCaptured = null;
@@ -360,30 +369,30 @@ describe('End-to-End Integration Test Suite & Mock VPS Validation', () => {
               Contents: [
                 // 1. Fresh backup from yesterday -> Keep
                 {
-                  Key: 'backups/hermes-backup-2026-08-28_030000.tar.gz',
+                  Key: freshKey,
                   Size: 15500000,
-                  LastModified: new Date('2026-08-28T03:00:00Z'),
+                  LastModified: oneDayAgo,
                   ETag: '"fresh-backup-etag"',
                 },
                 // 2. Expired backup from 10 days ago -> Delete
                 {
-                  Key: 'backups/hermes-backup-2026-08-19_030000.tar.gz',
+                  Key: expired10Key,
                   Size: 14800000,
-                  LastModified: new Date('2026-08-19T03:00:00Z'),
+                  LastModified: tenDaysAgo,
                   ETag: '"old-backup-etag-1"',
                 },
                 // 3. Expired backup from 5 days ago -> Delete
                 {
-                  Key: 'backups/hermes-backup-2026-08-24_030000.tar.gz',
+                  Key: expired5Key,
                   Size: 15100000,
-                  LastModified: new Date('2026-08-24T03:00:00Z'),
+                  LastModified: fiveDaysAgo,
                   ETag: '"old-backup-etag-2"',
                 },
                 // 4. Non-standard manual file in backups folder -> Preserve (do not delete)
                 {
                   Key: 'backups/custom_readme.txt',
                   Size: 200,
-                  LastModified: new Date('2026-08-10T00:00:00Z'),
+                  LastModified: new Date(Date.now() - 30 * 24 * 60 * 60 * 1000),
                   ETag: '"manual-file-etag"',
                 },
               ],
@@ -436,10 +445,7 @@ describe('End-to-End Integration Test Suite & Mock VPS Validation', () => {
       assert.ok(deleteObjectsCommandCaptured instanceof DeleteObjectsCommand);
       assert.equal(deleteObjectsCommandCaptured.input.Bucket, sampleSecrets.r2Bucket);
       const deletedKeys = deleteObjectsCommandCaptured.input.Delete.Objects.map((o) => o.Key);
-      assert.deepEqual(deletedKeys.sort(), [
-        'backups/hermes-backup-2026-08-19_030000.tar.gz',
-        'backups/hermes-backup-2026-08-24_030000.tar.gz',
-      ]);
+      assert.deepEqual(deletedKeys.sort(), [expired10Key, expired5Key].sort());
 
       // Verify temporary directory cleanup: No staging folders or archives remain in mockTempDir
       const remainingTempEntries = await fs.promises.readdir(mockTempDir);
@@ -489,10 +495,11 @@ describe('End-to-End Integration Test Suite & Mock VPS Validation', () => {
       assert.ok(fs.existsSync(path.join(restoredTestDir, 'context_length_cache.yaml')));
       assert.ok(fs.existsSync(path.join(restoredTestDir, 'channel_directory.json')));
       assert.ok(fs.existsSync(path.join(restoredTestDir, '.skills_prompt_snapshot.json')));
+      assert.ok(fs.existsSync(path.join(restoredTestDir, 'state.db')));
 
       // 3. Verify Blacklisted Excluded Files are ABSENT in Restored Destination
-      assert.equal(fs.existsSync(path.join(restoredTestDir, 'state.db')), false);
       assert.equal(fs.existsSync(path.join(restoredTestDir, 'state.db-wal')), false);
+      assert.equal(fs.existsSync(path.join(restoredTestDir, 'state.db-shm')), false);
       assert.equal(fs.existsSync(path.join(restoredTestDir, 'hermes-agent')), false);
       assert.equal(fs.existsSync(path.join(restoredTestDir, 'mnemosyne/models')), false);
       assert.equal(fs.existsSync(path.join(restoredTestDir, 'mnemosyne-venv')), false);

@@ -23,6 +23,7 @@ export {
   resolveBackupPathsSync,
   createStagingDirectory,
   cleanStagingDirectory,
+  stageLiveSqliteDatabase,
   stageBackup,
 } from './stager.js';
 
