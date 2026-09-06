@@ -1,6 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
+import crypto from 'node:crypto';
 import { parseArgs } from 'node:util';
 import { loadConfig, validateConfig } from './config.js';
 import { createSanitizer } from './sanitizer.js';
@@ -8,6 +9,8 @@ import {
   stageBackup,
   cleanStagingDirectory,
   formatBackupTimestamp,
+  verifySqliteIntegrity,
+  isPathWithinBase,
 } from './stager.js';
 import {
   createArchive,
@@ -15,15 +18,23 @@ import {
   cleanupArchive,
   cleanupTempResources,
   generateArchiveName,
+  unpackArchive,
+  createSafetySnapshot,
 } from './archiver.js';
 import {
   createR2Client,
   uploadBackup,
+  downloadBackup,
   listBackups,
+  getLatestBackup,
   pruneExpiredBackups,
   formatBackupListTable,
   formatBytes,
 } from './storage.js';
+import {
+  decryptArchiveFile,
+  isEncryptionEnabled,
+} from './crypto.js';
 import {
   sendFailureAlert,
   sendTestNotification,
@@ -45,6 +56,8 @@ export const COMMANDS = Object.freeze({
   BACKUP: 'backup',
   TEST_NOTIFY: 'test-notify',
   LIST: 'list',
+  RESTORE: 'restore',
+  VERIFY: 'verify',
 });
 
 /**
@@ -60,19 +73,27 @@ Commands:
   backup         Execute selective backup, compression, upload to R2, and prune expired archives
   test-notify    Send a test notification email via Brevo to verify credentials
   list           List existing backups stored in Cloudflare R2
+  restore        Download, verify, and restore a backup archive to HERMES_HOME or target directory
+  verify         Download and verify archive integrity end-to-end without modifying local state
 
 Options:
-  --dry-run          Simulate operations without making remote network mutations
-  -v, --verbose      Enable detailed step-by-step progress logging
-  -h, --help         Display help information
-  -V, --version      Display version number
-  --prefix <prefix>  Prefix filter for listing remote backups (default: 'backups/')
+  --target-dir <path>  Destination recovery directory (default: HERMES_HOME)
+  --latest             Select the most recent backup archive from R2
+  --force              Overwrite existing destination files without confirmation
+  --dry-run            Simulate operations without making remote network mutations
+  -v, --verbose        Enable detailed step-by-step progress logging
+  -h, --help           Display help information
+  -V, --version        Display version number
+  --prefix <prefix>    Prefix filter for listing remote backups (default: 'backups/')
 
 Examples:
   node cli.js backup
   node cli.js backup --dry-run --verbose
   node cli.js test-notify
   node cli.js list
+  node cli.js restore --latest
+  node cli.js restore hermes-backup-2025-01-01_120000.tar.gz --target-dir ~/.hermes
+  node cli.js verify --latest
 `;
 
 /**
@@ -81,12 +102,17 @@ Examples:
  * @param {string[]} [rawArgs=process.argv.slice(2)]
  * @returns {{
  *   command: string | null,
+ *   archiveName: string | null,
  *   options: {
  *     dryRun: boolean,
  *     verbose: boolean,
  *     help: boolean,
  *     version: boolean,
- *     prefix: string
+ *     prefix: string,
+ *     targetDir: string | undefined,
+ *     latest: boolean,
+ *     force: boolean,
+ *     archiveName: string | null
  *   },
  *   positionals: string[]
  * }}
@@ -98,6 +124,9 @@ export function parseCliArgs(rawArgs = process.argv.slice(2)) {
     help: { type: 'boolean', short: 'h', default: false },
     version: { type: 'boolean', short: 'V', default: false },
     prefix: { type: 'string', default: 'backups/' },
+    'target-dir': { type: 'string' },
+    latest: { type: 'boolean', default: false },
+    force: { type: 'boolean', default: false },
   };
 
   const { values, positionals } = parseArgs({
@@ -108,15 +137,24 @@ export function parseCliArgs(rawArgs = process.argv.slice(2)) {
   });
 
   const command = positionals[0] ? positionals[0].toLowerCase().trim() : null;
+  const rawPositional1 = positionals[1] ? positionals[1].trim() : null;
+  const isLatestPositional = rawPositional1 === 'latest' || rawPositional1 === '--latest';
+  const archiveName = isLatestPositional ? null : rawPositional1;
+  const latest = Boolean(values.latest) || isLatestPositional;
 
   return {
     command,
+    archiveName,
     options: {
       dryRun: Boolean(values['dry-run']),
       verbose: Boolean(values.verbose),
       help: Boolean(values.help),
       version: Boolean(values.version),
       prefix: typeof values.prefix === 'string' ? values.prefix : 'backups/',
+      targetDir: typeof values['target-dir'] === 'string' ? values['target-dir'] : undefined,
+      latest,
+      force: Boolean(values.force),
+      archiveName,
     },
     positionals,
   };
@@ -568,6 +606,576 @@ export async function listCommand(options = {}, context = {}) {
 }
 
 /**
+ * Inspects the initial two bytes of a file to determine if it is gzip-compressed.
+ * @param {string} filePath
+ * @returns {Promise<boolean>}
+ */
+async function isGzipFile(filePath) {
+  let fileHandle;
+  try {
+    fileHandle = await fs.promises.open(filePath, 'r');
+    const buffer = Buffer.alloc(2);
+    const { bytesRead } = await fileHandle.read(buffer, 0, 2, 0);
+    return bytesRead === 2 && buffer[0] === 0x1f && buffer[1] === 0x8b;
+  } catch {
+    return false;
+  } finally {
+    if (fileHandle) {
+      await fileHandle.close().catch(() => {});
+    }
+  }
+}
+
+/**
+ * Recursively collects all regular files in a directory tree.
+ * @param {string} dirPath
+ * @param {string} [baseDir=dirPath]
+ * @returns {Promise<Array<{ absolutePath: string, relativePath: string }>>}
+ */
+async function getAllFiles(dirPath, baseDir = dirPath) {
+  const results = [];
+  const entries = await fs.promises.readdir(dirPath, { withFileTypes: true });
+  for (const entry of entries) {
+    const fullPath = path.join(dirPath, entry.name);
+    if (entry.isDirectory()) {
+      const subFiles = await getAllFiles(fullPath, baseDir);
+      results.push(...subFiles);
+    } else if (entry.isFile()) {
+      results.push({
+        absolutePath: fullPath,
+        relativePath: path.relative(baseDir, fullPath),
+      });
+    }
+  }
+  return results;
+}
+
+/**
+ * Executes the restore command: downloads archive from R2, verifies SHA-256,
+ * decrypts if encrypted, unpacks to recovery staging directory, runs PRAGMA integrity_check
+ * on databases, creates a pre-restore safety snapshot, and restores files to destination.
+ *
+ * @param {object} [options={}]
+ * @param {string} [options.archiveName]
+ * @param {boolean} [options.latest=false]
+ * @param {string} [options.targetDir]
+ * @param {boolean} [options.dryRun=false]
+ * @param {boolean} [options.force=false]
+ * @param {boolean} [options.verbose=false]
+ * @param {string} [options.prefix='backups/']
+ * @param {object} [context={}]
+ * @param {Record<string, string | undefined>} [context.env=process.env]
+ * @param {object} [context.config]
+ * @param {object} [context.io=console]
+ * @param {import('@aws-sdk/client-s3').S3Client} [context.s3Client]
+ * @param {string} [context.lockFilePath]
+ * @param {ProcessLock} [context.processLock]
+ * @param {string} [context.sqliteBinary='sqlite3']
+ * @returns {Promise<{ success: boolean, exitCode: number, error?: Error, summary?: object }>}
+ */
+export async function restoreCommand(options = {}, context = {}) {
+  const {
+    archiveName: rawArchiveName,
+    latest = false,
+    targetDir: customTargetDir,
+    dryRun = false,
+    force = false,
+    verbose = false,
+    prefix = 'backups/',
+  } = options;
+
+  const {
+    env = process.env,
+    config: customConfig,
+    io = console,
+    s3Client,
+    lockFilePath: customLockFilePath,
+    processLock: customProcessLock,
+    sqliteBinary = 'sqlite3',
+  } = context;
+
+  const config = customConfig || loadConfig(env);
+  const sanitizer = createSanitizer(config);
+
+  const log = (msg) => io.log(msg);
+  const logVerbose = (msg) => {
+    if (verbose) io.log(msg);
+  };
+  const logError = (msg) => io.error(msg);
+
+  const targetDir = customTargetDir
+    ? path.resolve(customTargetDir)
+    : path.resolve(config.hermesHome);
+
+  let recoveryDir = null;
+  let lockAcquired = false;
+
+  const lockFilePath = customLockFilePath || path.join(config.tempDir, DEFAULT_LOCK_FILENAME);
+  const processLock = customProcessLock || new ProcessLock(lockFilePath);
+
+  try {
+    // Validate configuration
+    validateConfig(config, {
+      requireR2: !dryRun,
+      requireBrevo: false,
+      throwOnError: true,
+    });
+
+    log('[INFO] Starting Hermes restore operation...');
+
+    // Resolve target backup key
+    let targetKey = null;
+    const isLatest = latest || rawArchiveName === 'latest' || rawArchiveName === '--latest';
+    const archiveName = isLatest ? null : rawArchiveName;
+
+    if (isLatest) {
+      logVerbose('[INFO] Resolving latest backup from Cloudflare R2...');
+      if (dryRun && !s3Client) {
+        targetKey = 'backups/latest-simulated.tar.gz';
+      } else {
+        const latestBackup = await getLatestBackup(config, {
+          client: s3Client,
+          prefix,
+        });
+        if (!latestBackup) {
+          throw new Error(
+            `No backup archives found in Cloudflare R2 bucket: ${config.r2.bucketName}`
+          );
+        }
+        targetKey = latestBackup.key;
+      }
+    } else if (archiveName && typeof archiveName === 'string' && archiveName.trim().length > 0) {
+      targetKey = archiveName.trim();
+    } else {
+      throw new Error('Archive name or --latest flag must be specified for restore.');
+    }
+
+    log(`[INFO] Selected archive for recovery: ${targetKey}`);
+    log(`[INFO] Destination directory: ${targetDir}`);
+
+    if (dryRun) {
+      log('[INFO] [DRY-RUN] Simulating restore without modifying local state');
+      log('[INFO] [DRY-RUN] Restore simulation completed successfully.');
+      return {
+        success: true,
+        exitCode: 0,
+        summary: {
+          key: targetKey,
+          targetDir,
+          dryRun: true,
+        },
+      };
+    }
+
+    // Acquire process lock for recovery
+    await processLock.acquire();
+    lockAcquired = true;
+    logVerbose(`[INFO] Acquired process lock: ${lockFilePath} (PID: ${process.pid})`);
+
+    // Create isolated recovery temporary directory
+    const recoveryId = `hermes-restore-${Date.now()}-${crypto.randomBytes(4).toString('hex')}`;
+    recoveryDir = path.join(config.tempDir, recoveryId);
+    await fs.promises.mkdir(recoveryDir, { recursive: true });
+
+    // 1. Download Step
+    const archiveBasename = path.posix.basename(targetKey);
+    const downloadDestPath = path.join(recoveryDir, archiveBasename);
+    log(`[INFO] Downloading backup from Cloudflare R2 bucket: ${config.r2.bucketName}...`);
+
+    const downloadResult = await downloadBackup(targetKey, downloadDestPath, config, {
+      client: s3Client,
+    });
+    log(
+      `[INFO] Downloaded ${formatBytes(downloadResult.size)} (SHA-256: ${downloadResult.sha256.slice(0, 16)}...)`
+    );
+
+    // 2. Decryption Step (if encrypted)
+    let archiveToExtract = downloadDestPath;
+    const metadata = downloadResult.metadata || {};
+    const isExplicitlyEncrypted =
+      metadata.encrypted === 'true' || metadata.algorithm === 'aes-256-gcm';
+    const isGzip = await isGzipFile(downloadDestPath);
+    const requiresDecryption =
+      isExplicitlyEncrypted || (isEncryptionEnabled(config) && !isGzip);
+
+    if (requiresDecryption) {
+      if (!isEncryptionEnabled(config)) {
+        throw new Error('Archive is encrypted but BACKUP_ENCRYPTION_KEY is not configured');
+      }
+
+      const decryptedPath = path.join(recoveryDir, 'decrypted-archive.tar.gz');
+      log('[INFO] Decrypting archive using configured AES-256-GCM encryption key...');
+      await decryptArchiveFile(downloadDestPath, decryptedPath, config.encryptionKey);
+      logVerbose('[INFO] Archive decrypted successfully');
+      archiveToExtract = decryptedPath;
+    }
+
+    // 3. Validation Step (tar integrity check)
+    log('[INFO] Verifying archive structure...');
+    const validationResult = await validateArchive(archiveToExtract);
+    logVerbose(`[INFO] Archive integrity verified (${validationResult.entries.length} entries)`);
+
+    // 4. Staging / Unpack Step
+    const unpackStagingDir = path.join(recoveryDir, 'staging');
+    await fs.promises.mkdir(unpackStagingDir, { recursive: true });
+    await unpackArchive(archiveToExtract, unpackStagingDir);
+    log(`[INFO] Unpacked ${validationResult.entries.length} files to recovery staging directory`);
+
+    // 5. SQLite Structural Integrity Verification
+    const stagedFiles = await getAllFiles(unpackStagingDir);
+    const dbFiles = stagedFiles.filter((f) => f.relativePath.toLowerCase().endsWith('.db'));
+
+    for (const dbFile of dbFiles) {
+      const isValid = await verifySqliteIntegrity(dbFile.absolutePath, {
+        sqliteBinary,
+        onWarning: (msg) => {
+          if (typeof io.warn === 'function') {
+            io.warn(`[WARN] ${msg}`);
+          } else {
+            log(`[WARN] ${msg}`);
+          }
+        },
+      });
+
+      if (!isValid) {
+        const error = new Error(
+          `SQLite integrity check failed for restored database: ${dbFile.relativePath}`
+        );
+        error.code = 'SQLITE_INTEGRITY_CHECK_FAILED';
+        throw error;
+      }
+    }
+    if (dbFiles.length > 0) {
+      logVerbose(
+        `[INFO] SQLite structural integrity verified across ${dbFiles.length} database(s)`
+      );
+    }
+
+    // 6. Pre-restore Safety Snapshot
+    let safetySnapshot = null;
+    if (fs.existsSync(targetDir)) {
+      safetySnapshot = await createSafetySnapshot(targetDir, {
+        tempDir: config.tempDir,
+      });
+      if (safetySnapshot) {
+        log(
+          `[INFO] Created pre-restore safety snapshot: ${safetySnapshot.snapshotPath} (${formatBytes(safetySnapshot.size)})`
+        );
+      }
+    }
+
+    // 7. Synchronize files to target directory
+    await fs.promises.mkdir(targetDir, { recursive: true });
+    let restoredCount = 0;
+
+    for (const item of stagedFiles) {
+      const normalizedRel = path.normalize(item.relativePath);
+      if (
+        normalizedRel.startsWith('..' + path.sep) ||
+        normalizedRel === '..' ||
+        path.isAbsolute(normalizedRel)
+      ) {
+        throw new Error(
+          `Security violation: restored path resolves outside target directory: ${item.relativePath}`
+        );
+      }
+
+      const destPath = path.resolve(targetDir, normalizedRel);
+      const relToTarget = path.relative(targetDir, destPath);
+      if (
+        relToTarget.startsWith('..' + path.sep) ||
+        relToTarget === '..' ||
+        path.isAbsolute(relToTarget)
+      ) {
+        throw new Error(
+          `Security violation: restored path resolves outside target directory: ${item.relativePath}`
+        );
+      }
+
+      await fs.promises.mkdir(path.dirname(destPath), { recursive: true });
+      await fs.promises.copyFile(item.absolutePath, destPath);
+
+      const isSafe = await isPathWithinBase(destPath, targetDir);
+      if (!isSafe) {
+        await fs.promises.unlink(destPath).catch(() => {});
+        throw new Error(
+          `Security violation: restored path resolves outside target directory: ${item.relativePath}`
+        );
+      }
+
+      restoredCount++;
+      logVerbose(`  - Restored: ${item.relativePath}`);
+    }
+
+    // 8. Cleanup Temporary Recovery Resources
+    await fs.promises.rm(recoveryDir, { recursive: true, force: true });
+    recoveryDir = null;
+
+    log(`[INFO] Restored ${restoredCount} files to ${targetDir}. Restore completed successfully.`);
+
+    return {
+      success: true,
+      exitCode: 0,
+      summary: {
+        key: targetKey,
+        targetDir,
+        restoredCount,
+        safetySnapshot: safetySnapshot?.snapshotPath || null,
+        dryRun: false,
+      },
+    };
+  } catch (rawError) {
+    const sanitizedError = sanitizer(rawError);
+    logError(`[ERROR] Restore failed: ${sanitizedError.message || sanitizedError}`);
+
+    if (verbose && sanitizedError.stack) {
+      logError(sanitizedError.stack);
+    }
+
+    if (recoveryDir) {
+      try {
+        await fs.promises.rm(recoveryDir, { recursive: true, force: true });
+      } catch {
+        // Ignore emergency cleanup errors
+      }
+    }
+
+    return {
+      success: false,
+      exitCode: 1,
+      error: sanitizedError,
+    };
+  } finally {
+    if (lockAcquired) {
+      try {
+        await processLock.release();
+        logVerbose(`[INFO] Released process lock: ${lockFilePath}`);
+      } catch (releaseErr) {
+        logVerbose(`[WARN] Failed to release process lock: ${releaseErr.message}`);
+      }
+    }
+  }
+}
+
+/**
+ * Executes the verify command: downloads archive, verifies SHA-256, decrypts if needed,
+ * validates tar, checks SQLite integrity, without modifying local state.
+ *
+ * @param {object} [options={}]
+ * @param {string} [options.archiveName]
+ * @param {boolean} [options.latest=false]
+ * @param {boolean} [options.dryRun=false]
+ * @param {boolean} [options.verbose=false]
+ * @param {string} [options.prefix='backups/']
+ * @param {object} [context={}]
+ * @param {Record<string, string | undefined>} [context.env=process.env]
+ * @param {object} [context.config]
+ * @param {object} [context.io=console]
+ * @param {import('@aws-sdk/client-s3').S3Client} [context.s3Client]
+ * @param {string} [context.sqliteBinary='sqlite3']
+ * @returns {Promise<{ success: boolean, exitCode: number, error?: Error, summary?: object }>}
+ */
+export async function verifyCommand(options = {}, context = {}) {
+  const {
+    archiveName: rawArchiveName,
+    latest = false,
+    dryRun = false,
+    verbose = false,
+    prefix = 'backups/',
+  } = options;
+
+  const {
+    env = process.env,
+    config: customConfig,
+    io = console,
+    s3Client,
+    sqliteBinary = 'sqlite3',
+  } = context;
+
+  const config = customConfig || loadConfig(env);
+  const sanitizer = createSanitizer(config);
+
+  const log = (msg) => io.log(msg);
+  const logVerbose = (msg) => {
+    if (verbose) io.log(msg);
+  };
+  const logError = (msg) => io.error(msg);
+
+  let recoveryDir = null;
+
+  try {
+    // Validate configuration
+    validateConfig(config, {
+      requireR2: !dryRun,
+      requireBrevo: false,
+      throwOnError: true,
+    });
+
+    log('[INFO] Starting Hermes archive verification...');
+
+    // Resolve target backup key
+    let targetKey = null;
+    const isLatest = latest || rawArchiveName === 'latest' || rawArchiveName === '--latest';
+    const archiveName = isLatest ? null : rawArchiveName;
+
+    if (isLatest) {
+      logVerbose('[INFO] Resolving latest backup from Cloudflare R2...');
+      if (dryRun && !s3Client) {
+        targetKey = 'backups/latest-simulated.tar.gz';
+      } else {
+        const latestBackup = await getLatestBackup(config, {
+          client: s3Client,
+          prefix,
+        });
+        if (!latestBackup) {
+          throw new Error(
+            `No backup archives found in Cloudflare R2 bucket: ${config.r2.bucketName}`
+          );
+        }
+        targetKey = latestBackup.key;
+      }
+    } else if (archiveName && typeof archiveName === 'string' && archiveName.trim().length > 0) {
+      targetKey = archiveName.trim();
+    } else {
+      throw new Error('Archive name or --latest flag must be specified for verify.');
+    }
+
+    log(`[INFO] Selected archive for verification: ${targetKey}`);
+
+    if (dryRun) {
+      log('[INFO] [DRY-RUN] Simulating verification without downloading');
+      log('[INFO] [DRY-RUN] Archive verification simulated successfully.');
+      return {
+        success: true,
+        exitCode: 0,
+        summary: {
+          key: targetKey,
+          dryRun: true,
+        },
+      };
+    }
+
+    // Create isolated verification temporary directory
+    const recoveryId = `hermes-verify-${Date.now()}-${crypto.randomBytes(4).toString('hex')}`;
+    recoveryDir = path.join(config.tempDir, recoveryId);
+    await fs.promises.mkdir(recoveryDir, { recursive: true });
+
+    // 1. Download Step (with SHA-256 validation)
+    const archiveBasename = path.posix.basename(targetKey);
+    const downloadDestPath = path.join(recoveryDir, archiveBasename);
+    log(`[INFO] Downloading backup from Cloudflare R2 bucket: ${config.r2.bucketName}...`);
+
+    const downloadResult = await downloadBackup(targetKey, downloadDestPath, config, {
+      client: s3Client,
+    });
+    log(
+      `[INFO] Downloaded ${formatBytes(downloadResult.size)} (SHA-256: ${downloadResult.sha256.slice(0, 16)}...)`
+    );
+
+    // 2. Decryption Step (if encrypted)
+    let archiveToValidate = downloadDestPath;
+    const metadata = downloadResult.metadata || {};
+    const isExplicitlyEncrypted =
+      metadata.encrypted === 'true' || metadata.algorithm === 'aes-256-gcm';
+    const isGzip = await isGzipFile(downloadDestPath);
+    const requiresDecryption =
+      isExplicitlyEncrypted || (isEncryptionEnabled(config) && !isGzip);
+
+    if (requiresDecryption) {
+      if (!isEncryptionEnabled(config)) {
+        throw new Error('Archive is encrypted but BACKUP_ENCRYPTION_KEY is not configured');
+      }
+
+      const decryptedPath = path.join(recoveryDir, 'decrypted-archive.tar.gz');
+      log('[INFO] Decrypting archive using configured AES-256-GCM encryption key...');
+      await decryptArchiveFile(downloadDestPath, decryptedPath, config.encryptionKey);
+      logVerbose('[INFO] Archive decrypted successfully');
+      archiveToValidate = decryptedPath;
+    }
+
+    // 3. Validation Step (tar integrity check)
+    log('[INFO] Verifying archive structure...');
+    const validationResult = await validateArchive(archiveToValidate);
+    logVerbose(`[INFO] Archive integrity verified (${validationResult.entries.length} entries)`);
+
+    // 4. Unpack Step into temporary directory
+    const unpackStagingDir = path.join(recoveryDir, 'staging');
+    await fs.promises.mkdir(unpackStagingDir, { recursive: true });
+    await unpackArchive(archiveToValidate, unpackStagingDir);
+
+    // 5. SQLite Structural Integrity Verification
+    const stagedFiles = await getAllFiles(unpackStagingDir);
+    const dbFiles = stagedFiles.filter((f) => f.relativePath.toLowerCase().endsWith('.db'));
+
+    for (const dbFile of dbFiles) {
+      const isValid = await verifySqliteIntegrity(dbFile.absolutePath, {
+        sqliteBinary,
+        onWarning: (msg) => {
+          if (typeof io.warn === 'function') {
+            io.warn(`[WARN] ${msg}`);
+          } else {
+            log(`[WARN] ${msg}`);
+          }
+        },
+      });
+
+      if (!isValid) {
+        const error = new Error(
+          `SQLite integrity check failed for verified database: ${dbFile.relativePath}`
+        );
+        error.code = 'SQLITE_INTEGRITY_CHECK_FAILED';
+        throw error;
+      }
+    }
+    if (dbFiles.length > 0) {
+      logVerbose(
+        `[INFO] SQLite structural integrity verified across ${dbFiles.length} database(s)`
+      );
+    }
+
+    // 6. Cleanup Temporary Resources (HERMES_HOME is untouched)
+    await fs.promises.rm(recoveryDir, { recursive: true, force: true });
+    recoveryDir = null;
+
+    log(
+      `[INFO] Archive verification completed successfully. All checksums, structures, and ${dbFiles.length} SQLite database(s) intact.`
+    );
+
+    return {
+      success: true,
+      exitCode: 0,
+      summary: {
+        key: targetKey,
+        fileCount: validationResult.entries.length,
+        dbCount: dbFiles.length,
+        valid: true,
+      },
+    };
+  } catch (rawError) {
+    const sanitizedError = sanitizer(rawError);
+    logError(`[ERROR] Verification failed: ${sanitizedError.message || sanitizedError}`);
+
+    if (verbose && sanitizedError.stack) {
+      logError(sanitizedError.stack);
+    }
+
+    if (recoveryDir) {
+      try {
+        await fs.promises.rm(recoveryDir, { recursive: true, force: true });
+      } catch {
+        // Ignore emergency cleanup errors
+      }
+    }
+
+    return {
+      success: false,
+      exitCode: 1,
+      error: sanitizedError,
+    };
+  }
+}
+
+/**
  * Main CLI dispatcher. Parses arguments and routes to the appropriate command handler.
  *
  * @param {string[]} [rawArgs=process.argv.slice(2)]
@@ -617,6 +1225,16 @@ export async function runCli(rawArgs = process.argv.slice(2), context = {}) {
 
     case COMMANDS.LIST: {
       const result = await listCommand(options, { ...context, io });
+      return result.exitCode;
+    }
+
+    case COMMANDS.RESTORE: {
+      const result = await restoreCommand(options, { ...context, io });
+      return result.exitCode;
+    }
+
+    case COMMANDS.VERIFY: {
+      const result = await verifyCommand(options, { ...context, io });
       return result.exitCode;
     }
 

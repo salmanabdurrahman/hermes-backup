@@ -3,11 +3,14 @@ import path from 'node:path';
 import os from 'node:os';
 import https from 'node:https';
 import crypto from 'node:crypto';
+import { Readable, Transform } from 'node:stream';
+import { pipeline } from 'node:stream/promises';
 import {
   S3Client,
   PutObjectCommand,
   ListObjectsV2Command,
   DeleteObjectsCommand,
+  GetObjectCommand,
 } from '@aws-sdk/client-s3';
 import { NodeHttpHandler } from '@smithy/node-http-handler';
 import { validateConfig } from './config.js';
@@ -463,4 +466,147 @@ export function formatBackupListTable(backups = []) {
   );
 
   return [headerLine, separatorLine, ...dataLines].join('\n');
+}
+
+/**
+ * Downloads a backup archive from Cloudflare R2 bucket.
+ * Streams content to destination path and verifies SHA-256 digest against object metadata.
+ *
+ * @param {string} key - S3 object key or archive filename
+ * @param {string} destinationPath - Path where the downloaded file will be saved
+ * @param {object} config - Application configuration object
+ * @param {object} [options={}]
+ * @param {S3Client} [options.client] - Optional pre-instantiated S3Client
+ * @param {string} [options.bucketName] - Bucket name override
+ * @returns {Promise<{
+ *   key: string,
+ *   bucket: string,
+ *   destinationPath: string,
+ *   size: number,
+ *   sha256: string,
+ *   etag: string,
+ *   metadata: Record<string, string>,
+ *   lastModified: Date
+ * }>}
+ */
+export async function downloadBackup(key, destinationPath, config, options = {}) {
+  const {
+    client: customClient,
+    bucketName = config?.r2?.bucketName || 'hermes-backups',
+  } = options;
+
+  if (!key || typeof key !== 'string') {
+    throw new Error('Backup key must be a non-empty string');
+  }
+  if (!destinationPath || typeof destinationPath !== 'string') {
+    throw new Error('Destination path must be a non-empty string');
+  }
+
+  const resolvedDest = path.resolve(destinationPath);
+  const client = customClient || createR2Client(config);
+
+  let objectKey = key.trim();
+  if (!objectKey.startsWith('backups/') && !objectKey.includes('/')) {
+    objectKey = `backups/${objectKey}`;
+  }
+
+  try {
+    const command = new GetObjectCommand({
+      Bucket: bucketName,
+      Key: objectKey,
+    });
+
+    const response = await client.send(command);
+    if (!response.Body) {
+      throw new Error(`Empty response body for object: ${objectKey}`);
+    }
+
+    await fs.promises.mkdir(path.dirname(resolvedDest), { recursive: true });
+
+    let bodyStream = response.Body;
+    if (Buffer.isBuffer(bodyStream) || typeof bodyStream === 'string') {
+      bodyStream = Readable.from(bodyStream);
+    }
+
+    const hash = crypto.createHash('sha256');
+    const hashTransform = new Transform({
+      transform(chunk, encoding, callback) {
+        hash.update(chunk);
+        callback(null, chunk);
+      },
+    });
+
+    const fileWriteStream = fs.createWriteStream(resolvedDest);
+    await pipeline(bodyStream, hashTransform, fileWriteStream);
+
+    const actualSha256 = hash.digest('hex');
+    const fileStat = await fs.promises.stat(resolvedDest);
+
+    // Normalize metadata headers (S3 returns metadata keys lowercased)
+    const rawMetadata = response.Metadata || {};
+    const metadata = {};
+    for (const [k, v] of Object.entries(rawMetadata)) {
+      metadata[k.toLowerCase()] = v;
+    }
+
+    const expectedSha256 = metadata.sha256;
+    if (expectedSha256 && expectedSha256.toLowerCase() !== actualSha256.toLowerCase()) {
+      try {
+        await fs.promises.unlink(resolvedDest);
+      } catch {
+        // Ignore unlink failure
+      }
+      throw new Error(
+        `SHA-256 checksum mismatch for ${objectKey}: expected ${expectedSha256}, got ${actualSha256}`
+      );
+    }
+
+    return {
+      key: objectKey,
+      bucket: bucketName,
+      destinationPath: resolvedDest,
+      size: fileStat.size,
+      sha256: actualSha256,
+      etag: response.ETag ? response.ETag.replace(/^"|"$/g, '') : '',
+      metadata,
+      lastModified: response.LastModified instanceof Date ? response.LastModified : new Date(response.LastModified || 0),
+    };
+  } catch (err) {
+    try {
+      if (fs.existsSync(resolvedDest)) {
+        await fs.promises.unlink(resolvedDest);
+      }
+    } catch {
+      // Ignore cleanup error
+    }
+
+    const sanitizer = createSanitizer(config);
+    throw sanitizer(err);
+  }
+}
+
+/**
+ * Resolves the latest backup archive from Cloudflare R2 bucket.
+ *
+ * @param {object} config - Application configuration object
+ * @param {object} [options={}]
+ * @param {S3Client} [options.client] - Optional pre-instantiated S3Client
+ * @param {string} [options.bucketName] - Bucket name override
+ * @param {string} [options.prefix='backups/'] - Prefix filter for objects
+ * @returns {Promise<{
+ *   key: string,
+ *   name: string,
+ *   size: number,
+ *   lastModified: Date,
+ *   etag: string,
+ *   isBackup: boolean
+ * } | null>}
+ */
+export async function getLatestBackup(config, options = {}) {
+  const result = await listBackups(config, options);
+  const backups = result.backups.filter((b) => b.isBackup);
+  if (backups.length === 0) {
+    return null;
+  }
+  return backups[0];
 }

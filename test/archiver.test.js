@@ -16,6 +16,8 @@ import {
   cleanupTempResources,
   registerProcessCleanup,
   withStagingCleanup,
+  unpackArchive,
+  createSafetySnapshot,
 } from '../src/archiver.js';
 import { cleanStagingDirectory } from '../src/stager.js';
 
@@ -345,6 +347,81 @@ describe('Streaming tar.gz Archiver & Staging Cleanup Engine', () => {
 
       // Unregister should cleanly remove it without throwing
       unregister();
+    });
+  });
+
+  describe('Archive Extraction and Safety Snapshot Creation', () => {
+    it('should extract tar.gz archive into destination directory using unpackArchive', async () => {
+      // Create source files in mock staging
+      await fs.promises.writeFile(path.join(mockStagingDir, 'config.yaml'), 'model: test\n');
+      const subDir = path.join(mockStagingDir, 'sub');
+      await fs.promises.mkdir(subDir, { recursive: true });
+      await fs.promises.writeFile(path.join(subDir, 'state.txt'), 'nested content\n');
+
+      const archiveResult = await createArchive(mockStagingDir, {
+        outputDir: testTempDir,
+      });
+
+      const targetUnpackDir = path.join(testTempDir, 'unpacked');
+      const unpackResult = await unpackArchive(archiveResult.archivePath, targetUnpackDir);
+
+      assert.equal(typeof unpackResult.extractedCount, 'number');
+      assert.ok(unpackResult.extractedCount >= 2);
+      assert.ok(fs.existsSync(path.join(targetUnpackDir, 'config.yaml')));
+      assert.ok(fs.existsSync(path.join(targetUnpackDir, 'sub', 'state.txt')));
+
+      const extractedContent = await fs.promises.readFile(
+        path.join(targetUnpackDir, 'config.yaml'),
+        'utf8'
+      );
+      assert.equal(extractedContent, 'model: test\n');
+    });
+
+    it('should reject invalid arguments on unpackArchive', async () => {
+      await assert.rejects(
+        () => unpackArchive('', '/tmp/dest'),
+        (err) => err.message.includes('Archive path must be a non-empty string')
+      );
+      await assert.rejects(
+        () => unpackArchive('/tmp/fake.tar.gz', ''),
+        (err) => err.message.includes('Target directory must be a non-empty string')
+      );
+      await assert.rejects(
+        () => unpackArchive(path.join(testTempDir, 'nonexistent.tar.gz'), path.join(testTempDir, 'dest')),
+        (err) => err.message.includes('Archive file not found')
+      );
+    });
+
+    it('should create pre-restore safety snapshot for directory with active files', async () => {
+      const activeDir = path.join(testTempDir, 'active_hermes');
+      await fs.promises.mkdir(activeDir, { recursive: true });
+      await fs.promises.writeFile(path.join(activeDir, 'SOUL.md'), '# Active Agent\n');
+      await fs.promises.writeFile(path.join(activeDir, 'config.json'), '{"active":true}\n');
+
+      const snapshot = await createSafetySnapshot(activeDir, {
+        tempDir: testTempDir,
+      });
+
+      assert.ok(snapshot !== null);
+      assert.ok(fs.existsSync(snapshot.snapshotPath));
+      assert.ok(snapshot.size > 0);
+      assert.equal(snapshot.entryCount, 2);
+      assert.ok(snapshot.snapshotName.startsWith('pre-restore-snapshot-'));
+
+      // Validate snapshot integrity with validateArchive
+      const validation = await validateArchive(snapshot.snapshotPath);
+      assert.equal(validation.valid, true);
+    });
+
+    it('should return null when creating snapshot of non-existent or empty directory', async () => {
+      const nonExistent = path.join(testTempDir, 'does-not-exist');
+      const nullResult1 = await createSafetySnapshot(nonExistent, { tempDir: testTempDir });
+      assert.equal(nullResult1, null);
+
+      const emptyDir = path.join(testTempDir, 'empty_dir');
+      await fs.promises.mkdir(emptyDir, { recursive: true });
+      const nullResult2 = await createSafetySnapshot(emptyDir, { tempDir: testTempDir });
+      assert.equal(nullResult2, null);
     });
   });
 });

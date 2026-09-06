@@ -5,12 +5,20 @@ import path from 'node:path';
 import os from 'node:os';
 import { execFileSync, execFile } from 'node:child_process';
 import { promisify } from 'node:util';
-import { PutObjectCommand, ListObjectsV2Command, DeleteObjectsCommand } from '@aws-sdk/client-s3';
+import {
+  PutObjectCommand,
+  ListObjectsV2Command,
+  DeleteObjectsCommand,
+  GetObjectCommand,
+} from '@aws-sdk/client-s3';
 import {
   runCli,
   backupCommand,
   testNotifyCommand,
   listCommand,
+  restoreCommand,
+  verifyCommand,
+  validateArchive,
   loadConfig,
   formatBytes,
   formatBackupTimestamp,
@@ -838,6 +846,163 @@ describe('End-to-End Integration Test Suite & Mock VPS Validation', () => {
 
       assert.ok(stdout.includes('[INFO] Sending test notification email via Brevo...'));
       assert.ok(stdout.includes('[INFO] [DRY-RUN] Test email simulated successfully'));
+    });
+  });
+
+  describe('Disaster Recovery Subcommands End-to-End: restore and verify', () => {
+    it('should perform complete round-trip backup, verify, and disaster recovery restore with intact databases', async () => {
+      const io = createMockIo();
+      const config = createTestConfig();
+
+      // In-memory S3 mock storage to simulate R2 bucket
+      const r2Store = new Map();
+
+      const mockS3Client = {
+        send: async (command) => {
+          if (command instanceof PutObjectCommand) {
+            const chunks = [];
+            const body = command.input.Body;
+            let buffer;
+            if (Buffer.isBuffer(body)) {
+              buffer = body;
+            } else if (typeof body.on === 'function') {
+              for await (const chunk of body) {
+                chunks.push(chunk);
+              }
+              buffer = Buffer.concat(chunks);
+            }
+            r2Store.set(command.input.Key, {
+              buffer,
+              metadata: command.input.Metadata || {},
+              lastModified: new Date(),
+            });
+            return { ETag: '"e2e-r2-upload-etag"' };
+          }
+
+          if (command instanceof ListObjectsV2Command) {
+            const contents = [];
+            for (const [key, obj] of r2Store.entries()) {
+              contents.push({
+                Key: key,
+                Size: obj.buffer.length,
+                LastModified: obj.lastModified,
+                ETag: '"etag-r2"',
+              });
+            }
+            return { Contents: contents, IsTruncated: false };
+          }
+
+          if (command instanceof GetObjectCommand) {
+            const obj = r2Store.get(command.input.Key);
+            if (!obj) {
+              const err = new Error(`NoSuchKey: ${command.input.Key}`);
+              err.name = 'NoSuchKey';
+              throw err;
+            }
+            return {
+              Body: obj.buffer,
+              Metadata: obj.metadata,
+              LastModified: obj.lastModified,
+              ETag: '"etag-r2"',
+            };
+          }
+
+          if (command instanceof DeleteObjectsCommand) {
+            return { Deleted: [] };
+          }
+
+          throw new Error(`Unexpected command: ${command.constructor.name}`);
+        },
+      };
+
+      // 1. Run full backup
+      const backupResult = await backupCommand(
+        { dryRun: false, verbose: true },
+        { config, io, s3Client: mockS3Client }
+      );
+      assert.equal(backupResult.success, true);
+      assert.equal(backupResult.exitCode, 0);
+      assert.ok(r2Store.size >= 1);
+
+      // 2. Run verification without modifying destination
+      const verifyResult = await verifyCommand(
+        { latest: true, verbose: true },
+        { config, io, s3Client: mockS3Client }
+      );
+      assert.equal(verifyResult.success, true);
+      assert.equal(verifyResult.exitCode, 0);
+      assert.equal(verifyResult.summary.valid, true);
+
+      // 3. Disaster Recovery: Restore to an empty target directory
+      const restoredTargetDir = path.join(tempSuiteDir, 'restored_agent_home');
+      const restoreResult = await restoreCommand(
+        { latest: true, targetDir: restoredTargetDir, verbose: true },
+        { config, io, s3Client: mockS3Client }
+      );
+      assert.equal(restoreResult.success, true);
+      assert.equal(restoreResult.exitCode, 0);
+      assert.ok(restoreResult.summary.restoredCount > 0);
+
+      // 4. Validate restored files and database integrity
+      assert.ok(fs.existsSync(path.join(restoredTargetDir, 'config.yaml')));
+      assert.ok(fs.existsSync(path.join(restoredTargetDir, '.env')));
+      assert.ok(fs.existsSync(path.join(restoredTargetDir, 'SOUL.md')));
+      assert.ok(fs.existsSync(path.join(restoredTargetDir, 'memories', 'MEMORY.md')));
+      assert.ok(fs.existsSync(path.join(restoredTargetDir, 'skills', 'weather', 'SKILL.md')));
+
+      // Validate SQLite database queryability
+      const mnemosyneDb = path.join(restoredTargetDir, 'mnemosyne', 'data', 'mnemosyne.db');
+      assert.ok(fs.existsSync(mnemosyneDb));
+      const memoryRows = execFileSync('sqlite3', [
+        mnemosyneDb,
+        'SELECT concept, summary FROM long_term_memories ORDER BY id ASC;',
+      ]).toString().trim();
+      assert.ok(memoryRows.includes('user_preferences'));
+      assert.ok(memoryRows.includes('project_architecture'));
+
+      const stateDb = path.join(restoredTargetDir, 'state.db');
+      assert.ok(fs.existsSync(stateDb));
+      const stateRows = execFileSync('sqlite3', [
+        stateDb,
+        'SELECT session_token FROM active_sessions;',
+      ]).toString().trim();
+      assert.equal(stateRows, 'sess_xyz_active');
+
+      // 5. Pre-restore Safety Snapshot on secondary restore over active directory
+      await fs.promises.writeFile(
+        path.join(restoredTargetDir, 'active_working_state.txt'),
+        'in-flight work\n'
+      );
+      const secondaryRestore = await restoreCommand(
+        { latest: true, targetDir: restoredTargetDir },
+        { config, io, s3Client: mockS3Client }
+      );
+      assert.equal(secondaryRestore.success, true);
+      assert.ok(secondaryRestore.summary.safetySnapshot !== null);
+      assert.ok(fs.existsSync(secondaryRestore.summary.safetySnapshot));
+
+      // Verify the safety snapshot archive contains active_working_state.txt
+      const snapshotValidation = await validateArchive(secondaryRestore.summary.safetySnapshot);
+      assert.equal(snapshotValidation.valid, true);
+      assert.ok(snapshotValidation.entries.some((e) => e.includes('active_working_state.txt')));
+    });
+
+    it('should execute cli.js restore --help and verify --help via child process with exit code 0', async () => {
+      const cliPath = path.resolve('./cli.js');
+
+      const { stdout: restoreHelp } = await execFileAsync(
+        process.execPath,
+        [cliPath, 'restore', '--help']
+      );
+      assert.ok(restoreHelp.includes('Hermes Backup CLI'));
+      assert.ok(restoreHelp.includes('restore'));
+
+      const { stdout: verifyHelp } = await execFileAsync(
+        process.execPath,
+        [cliPath, 'verify', '--help']
+      );
+      assert.ok(verifyHelp.includes('Hermes Backup CLI'));
+      assert.ok(verifyHelp.includes('verify'));
     });
   });
 });

@@ -8,13 +8,16 @@ import {
   PutObjectCommand,
   ListObjectsV2Command,
   DeleteObjectsCommand,
+  GetObjectCommand,
 } from '@aws-sdk/client-s3';
 import {
   BACKUP_FILE_REGEX,
   formatBytes,
   createR2Client,
   uploadBackup,
+  downloadBackup,
   listBackups,
+  getLatestBackup,
   pruneExpiredBackups,
   formatBackupListTable,
 } from '../src/storage.js';
@@ -651,6 +654,129 @@ describe('Storage Module — Cloudflare R2 Client & Remote Retention Pruner', ()
       assert.ok(table.includes('hermes-backup-2026-08-29_100000.tar.gz'));
       assert.ok(table.includes('23.84 MB'));
       assert.ok(table.includes('etag12345'));
+    });
+  });
+
+  describe('downloadBackup', () => {
+    it('should download archive from R2 and verify SHA-256', async () => {
+      const payload = Buffer.from('simulated-backup-content-12345');
+      const expectedSha = crypto.createHash('sha256').update(payload).digest('hex');
+      const destPath = path.join(tempTestDir, 'downloaded.tar.gz');
+
+      let capturedCommand;
+      const mockClient = {
+        send: async (command) => {
+          capturedCommand = command;
+          return {
+            Body: payload,
+            ETag: '"etag-download-123"',
+            Metadata: {
+              sha256: expectedSha,
+            },
+            LastModified: new Date('2026-08-29T12:00:00Z'),
+          };
+        },
+      };
+
+      const result = await downloadBackup(
+        'hermes-backup-2026-08-29_120000.tar.gz',
+        destPath,
+        validConfig,
+        {
+          client: mockClient,
+        }
+      );
+
+      assert.equal(capturedCommand.input.Bucket, 'test-hermes-bucket');
+      assert.equal(
+        capturedCommand.input.Key,
+        'backups/hermes-backup-2026-08-29_120000.tar.gz'
+      );
+      assert.equal(result.sha256, expectedSha);
+      assert.equal(result.size, payload.length);
+      assert.ok(fs.existsSync(destPath));
+
+      const fileOnDisk = await fs.promises.readFile(destPath);
+      assert.deepEqual(fileOnDisk, payload);
+    });
+
+    it('should detect SHA-256 checksum mismatch, unlink corrupted destination, and throw error', async () => {
+      const payload = Buffer.from('corrupted-payload-data');
+      const destPath = path.join(tempTestDir, 'corrupt.tar.gz');
+
+      const mockClient = {
+        send: async () => ({
+          Body: payload,
+          Metadata: {
+            sha256: 'deadbeef1234567890abcdef1234567890abcdef1234567890abcdef12345678',
+          },
+        }),
+      };
+
+      await assert.rejects(
+        () =>
+          downloadBackup('hermes-backup.tar.gz', destPath, validConfig, {
+            client: mockClient,
+          }),
+        (err) => err.message.includes('SHA-256 checksum mismatch')
+      );
+
+      assert.ok(!fs.existsSync(destPath));
+    });
+
+    it('should reject invalid arguments on downloadBackup', async () => {
+      await assert.rejects(
+        () => downloadBackup('', '/tmp/dest', validConfig),
+        (err) => err.message.includes('Backup key must be a non-empty string')
+      );
+
+      await assert.rejects(
+        () => downloadBackup('key', '', validConfig),
+        (err) => err.message.includes('Destination path must be a non-empty string')
+      );
+    });
+  });
+
+  describe('getLatestBackup', () => {
+    it('should return the newest backup sorted by LastModified', async () => {
+      const mockContents = [
+        {
+          Key: 'backups/hermes-backup-2026-08-28_100000.tar.gz',
+          Size: 1000,
+          LastModified: new Date('2026-08-28T10:00:00Z'),
+          ETag: '"etag1"',
+        },
+        {
+          Key: 'backups/hermes-backup-2026-08-29_120000.tar.gz',
+          Size: 2000,
+          LastModified: new Date('2026-08-29T12:00:00Z'),
+          ETag: '"etag2"',
+        },
+      ];
+
+      const mockClient = {
+        send: async () => ({
+          Contents: mockContents,
+          IsTruncated: false,
+        }),
+      };
+
+      const latest = await getLatestBackup(validConfig, { client: mockClient });
+      assert.ok(latest);
+      assert.equal(latest.key, 'backups/hermes-backup-2026-08-29_120000.tar.gz');
+      assert.equal(latest.size, 2000);
+    });
+
+    it('should return null when no backups exist', async () => {
+      const mockClient = {
+        send: async () => ({
+          Contents: [],
+          IsTruncated: false,
+        }),
+      };
+
+      const latest = await getLatestBackup(validConfig, { client: mockClient });
+      assert.equal(latest, null);
     });
   });
 });

@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
+import crypto from 'node:crypto';
 import { execFile, execFileSync } from 'node:child_process';
 import { promisify } from 'node:util';
 import {
@@ -12,18 +13,31 @@ import {
   backupCommand,
   testNotifyCommand,
   listCommand,
+  restoreCommand,
+  verifyCommand,
   runCli,
   CLI_VERSION,
   COMMANDS,
   HELP_TEXT,
 } from '../src/cli.js';
 import {
+  createArchive,
+} from '../src/archiver.js';
+import {
+  encryptArchiveFile,
+} from '../src/crypto.js';
+import {
   ProcessLock,
   DEFAULT_LOCK_FILENAME,
   withProcessLock,
 } from '../src/lock.js';
 import * as HermesBackup from '../src/index.js';
-import { PutObjectCommand, ListObjectsV2Command, DeleteObjectsCommand } from '@aws-sdk/client-s3';
+import {
+  PutObjectCommand,
+  ListObjectsV2Command,
+  DeleteObjectsCommand,
+  GetObjectCommand,
+} from '@aws-sdk/client-s3';
 
 const execFileAsync = promisify(execFile);
 
@@ -146,6 +160,32 @@ describe('CLI Dispatcher & Command Routing', () => {
       const parsedList = parseCliArgs(['list', '--prefix', 'custom-backups/']);
       assert.equal(parsedList.command, 'list');
       assert.equal(parsedList.options.prefix, 'custom-backups/');
+    });
+
+    it('should parse restore subcommand with archive positional, --target-dir and --force', () => {
+      const parsed = parseCliArgs([
+        'restore',
+        'hermes-backup-2026-08-29_100000.tar.gz',
+        '--target-dir',
+        '/tmp/recovery',
+        '--force',
+      ]);
+      assert.equal(parsed.command, 'restore');
+      assert.equal(parsed.archiveName, 'hermes-backup-2026-08-29_100000.tar.gz');
+      assert.equal(parsed.options.targetDir, '/tmp/recovery');
+      assert.equal(parsed.options.force, true);
+      assert.equal(parsed.options.latest, false);
+    });
+
+    it('should parse restore and verify subcommands with --latest and --dry-run', () => {
+      const parsedRestore = parseCliArgs(['restore', '--latest', '--dry-run']);
+      assert.equal(parsedRestore.command, 'restore');
+      assert.equal(parsedRestore.options.latest, true);
+      assert.equal(parsedRestore.options.dryRun, true);
+
+      const parsedVerify = parseCliArgs(['verify', '--latest']);
+      assert.equal(parsedVerify.command, 'verify');
+      assert.equal(parsedVerify.options.latest, true);
     });
   });
 
@@ -680,6 +720,468 @@ describe('CLI Dispatcher & Command Routing', () => {
     });
   });
 
+  describe('restoreCommand execution', () => {
+    it('should execute restore in dry-run mode without disk or network operations', async () => {
+      const io = createMockIo();
+      const config = {
+        ...validTestConfig,
+        hermesHome: mockHermesHome,
+        tempDir: tempTestDir,
+      };
+
+      const result = await restoreCommand(
+        { dryRun: true, latest: true, verbose: true },
+        { config, io }
+      );
+
+      assert.equal(result.success, true);
+      assert.equal(result.exitCode, 0);
+      assert.equal(result.summary.dryRun, true);
+      assert.ok(io.getLogs().includes('[INFO] Starting Hermes restore operation...'));
+      assert.ok(io.getLogs().includes('[DRY-RUN] Simulating restore without modifying local state'));
+      assert.ok(io.getLogs().includes('Restore simulation completed successfully.'));
+    });
+
+    it('should fail if neither archive name nor --latest flag is specified', async () => {
+      const io = createMockIo();
+      const config = {
+        ...validTestConfig,
+        hermesHome: mockHermesHome,
+        tempDir: tempTestDir,
+      };
+
+      const result = await restoreCommand({}, { config, io });
+
+      assert.equal(result.success, false);
+      assert.equal(result.exitCode, 1);
+      assert.ok(io.getErrors().includes('Archive name or --latest flag must be specified for restore.'));
+    });
+
+    it('should download archive from R2, verify integrity, unpack, and restore to target directory', async () => {
+      const io = createMockIo();
+      const config = {
+        ...validTestConfig,
+        hermesHome: mockHermesHome,
+        tempDir: tempTestDir,
+      };
+
+      // Create a mock staging directory with sample files
+      const sampleStagingDir = path.join(tempTestDir, 'sample-stage');
+      await fs.promises.mkdir(sampleStagingDir, { recursive: true });
+      await fs.promises.writeFile(path.join(sampleStagingDir, 'config.yaml'), 'model: restored-llm\n');
+
+      const sampleDb = path.join(sampleStagingDir, 'state.db');
+      execFileSync('sqlite3', [
+        sampleDb,
+        `
+        CREATE TABLE agent_state (id INTEGER PRIMARY KEY, key TEXT, val TEXT);
+        INSERT INTO agent_state (key, val) VALUES ('session', 'restored-session-data');
+        `,
+      ]);
+
+      const archiveResult = await createArchive(sampleStagingDir, {
+        outputDir: tempTestDir,
+      });
+
+      const archiveBuffer = await fs.promises.readFile(archiveResult.archivePath);
+      const targetRecoveryDir = path.join(tempTestDir, 'target-recovery-home');
+
+      const mockS3Client = {
+        send: async (command) => {
+          if (command instanceof GetObjectCommand) {
+            return {
+              Body: archiveBuffer,
+              Metadata: {
+                sha256: archiveResult.sha256,
+              },
+              LastModified: new Date('2026-08-29T12:00:00Z'),
+            };
+          }
+          throw new Error(`Unexpected command: ${command.constructor.name}`);
+        },
+      };
+
+      const result = await restoreCommand(
+        {
+          archiveName: 'hermes-backup-2026-08-29_120000.tar.gz',
+          targetDir: targetRecoveryDir,
+          verbose: true,
+        },
+        { config, io, s3Client: mockS3Client }
+      );
+
+      assert.equal(result.success, true);
+      assert.equal(result.exitCode, 0);
+      assert.ok(result.summary.restoredCount >= 2);
+
+      // Verify files in target directory
+      assert.ok(fs.existsSync(path.join(targetRecoveryDir, 'config.yaml')));
+      assert.ok(fs.existsSync(path.join(targetRecoveryDir, 'state.db')));
+
+      const configContent = await fs.promises.readFile(
+        path.join(targetRecoveryDir, 'config.yaml'),
+        'utf8'
+      );
+      assert.equal(configContent, 'model: restored-llm\n');
+
+      const sqliteOut = execFileSync('sqlite3', [
+        path.join(targetRecoveryDir, 'state.db'),
+        'SELECT val FROM agent_state WHERE key = "session";',
+      ]).toString().trim();
+      assert.equal(sqliteOut, 'restored-session-data');
+    });
+
+    it('should create pre-restore safety snapshot when target directory contains active files', async () => {
+      const io = createMockIo();
+      const config = {
+        ...validTestConfig,
+        hermesHome: mockHermesHome,
+        tempDir: tempTestDir,
+      };
+
+      // Prepare target directory with pre-existing active data
+      const targetRecoveryDir = path.join(tempTestDir, 'existing-agent-home');
+      await fs.promises.mkdir(targetRecoveryDir, { recursive: true });
+      await fs.promises.writeFile(
+        path.join(targetRecoveryDir, 'existing-active-data.txt'),
+        'original-agent-data\n'
+      );
+
+      // Prepare an archive to restore
+      const sampleStagingDir = path.join(tempTestDir, 'restore-stage-src');
+      await fs.promises.mkdir(sampleStagingDir, { recursive: true });
+      await fs.promises.writeFile(path.join(sampleStagingDir, 'new-file.txt'), 'restored-data\n');
+
+      const archiveResult = await createArchive(sampleStagingDir, {
+        outputDir: tempTestDir,
+      });
+      const archiveBuffer = await fs.promises.readFile(archiveResult.archivePath);
+
+      const mockS3Client = {
+        send: async (command) => {
+          if (command instanceof GetObjectCommand) {
+            return {
+              Body: archiveBuffer,
+              Metadata: { sha256: archiveResult.sha256 },
+              LastModified: new Date('2026-08-29T12:00:00Z'),
+            };
+          }
+        },
+      };
+
+      const result = await restoreCommand(
+        {
+          archiveName: 'hermes-backup-2026-08-29_120000.tar.gz',
+          targetDir: targetRecoveryDir,
+        },
+        { config, io, s3Client: mockS3Client }
+      );
+
+      assert.equal(result.success, true);
+      assert.equal(result.exitCode, 0);
+      assert.ok(result.summary.safetySnapshot !== null);
+      assert.ok(fs.existsSync(result.summary.safetySnapshot));
+      assert.ok(io.getLogs().includes('Created pre-restore safety snapshot:'));
+    });
+
+    it('should decrypt AES-256-GCM encrypted backup archive when BACKUP_ENCRYPTION_KEY is configured', async () => {
+      const io = createMockIo();
+      const testEncryptionKey = 'my-secret-restore-passphrase-99';
+      const config = {
+        ...validTestConfig,
+        hermesHome: mockHermesHome,
+        tempDir: tempTestDir,
+        encryptionKey: testEncryptionKey,
+      };
+
+      const sampleStagingDir = path.join(tempTestDir, 'enc-stage-src');
+      await fs.promises.mkdir(sampleStagingDir, { recursive: true });
+      await fs.promises.writeFile(
+        path.join(sampleStagingDir, 'SOUL.md'),
+        '# Decrypted Hermes Agent Persona\n'
+      );
+
+      const archiveResult = await createArchive(sampleStagingDir, { outputDir: tempTestDir });
+      const encryptedPath = path.join(tempTestDir, 'encrypted-backup.enc');
+      await encryptArchiveFile(archiveResult.archivePath, encryptedPath, testEncryptionKey);
+
+      const encryptedBuffer = await fs.promises.readFile(encryptedPath);
+      const encSha = crypto.createHash('sha256').update(encryptedBuffer).digest('hex');
+      const targetRecoveryDir = path.join(tempTestDir, 'decrypted-agent-home');
+
+      const mockS3Client = {
+        send: async (command) => {
+          if (command instanceof GetObjectCommand) {
+            return {
+              Body: encryptedBuffer,
+              Metadata: {
+                sha256: encSha,
+                encrypted: 'true',
+                algorithm: 'aes-256-gcm',
+              },
+              LastModified: new Date('2026-08-29T12:00:00Z'),
+            };
+          }
+        },
+      };
+
+      const result = await restoreCommand(
+        {
+          archiveName: 'hermes-backup-2026-08-29_120000.tar.gz',
+          targetDir: targetRecoveryDir,
+        },
+        { config, io, s3Client: mockS3Client }
+      );
+
+      assert.equal(result.success, true);
+      assert.equal(result.exitCode, 0);
+      assert.ok(fs.existsSync(path.join(targetRecoveryDir, 'SOUL.md')));
+
+      const soulContent = await fs.promises.readFile(
+        path.join(targetRecoveryDir, 'SOUL.md'),
+        'utf8'
+      );
+      assert.equal(soulContent, '# Decrypted Hermes Agent Persona\n');
+      assert.ok(io.getLogs().includes('Decrypting archive using configured AES-256-GCM encryption key...'));
+    });
+
+    it('should fail if archive is encrypted but BACKUP_ENCRYPTION_KEY is not configured', async () => {
+      const io = createMockIo();
+      const config = {
+        ...validTestConfig,
+        hermesHome: mockHermesHome,
+        tempDir: tempTestDir,
+        encryptionKey: undefined,
+      };
+
+      const encryptedBuffer = Buffer.from('dummy-encrypted-payload-not-gzip');
+      const mockS3Client = {
+        send: async () => ({
+          Body: encryptedBuffer,
+          Metadata: {
+            encrypted: 'true',
+          },
+        }),
+      };
+
+      const result = await restoreCommand(
+        { archiveName: 'hermes-backup.tar.gz' },
+        { config, io, s3Client: mockS3Client }
+      );
+
+      assert.equal(result.success, false);
+      assert.equal(result.exitCode, 1);
+      assert.ok(io.getErrors().includes('BACKUP_ENCRYPTION_KEY is not configured'));
+    });
+
+    it('should fail closed if restored SQLite database fails integrity check', async () => {
+      const io = createMockIo();
+      const config = {
+        ...validTestConfig,
+        hermesHome: mockHermesHome,
+        tempDir: tempTestDir,
+      };
+
+      // Create archive with a corrupted database file
+      const corruptStagingDir = path.join(tempTestDir, 'corrupt-db-stage');
+      await fs.promises.mkdir(corruptStagingDir, { recursive: true });
+      await fs.promises.writeFile(
+        path.join(corruptStagingDir, 'corrupted.db'),
+        'This is not a valid SQLite database header string!'
+      );
+
+      const archiveResult = await createArchive(corruptStagingDir, { outputDir: tempTestDir });
+      const archiveBuffer = await fs.promises.readFile(archiveResult.archivePath);
+      const targetRecoveryDir = path.join(tempTestDir, 'corrupted-recovery-target');
+
+      const mockS3Client = {
+        send: async () => ({
+          Body: archiveBuffer,
+          Metadata: { sha256: archiveResult.sha256 },
+        }),
+      };
+
+      const result = await restoreCommand(
+        {
+          archiveName: 'corrupt-backup.tar.gz',
+          targetDir: targetRecoveryDir,
+        },
+        { config, io, s3Client: mockS3Client }
+      );
+
+      assert.equal(result.success, false);
+      assert.equal(result.exitCode, 1);
+      assert.ok(io.getErrors().includes('SQLite integrity check failed'));
+      // Target directory must not have been created or modified with the corrupted file
+      assert.ok(!fs.existsSync(path.join(targetRecoveryDir, 'corrupted.db')));
+    });
+
+    it('should resolve newest backup from R2 when --latest is specified', async () => {
+      const io = createMockIo();
+      const config = {
+        ...validTestConfig,
+        hermesHome: mockHermesHome,
+        tempDir: tempTestDir,
+      };
+
+      const sampleStagingDir = path.join(tempTestDir, 'latest-test-stage');
+      await fs.promises.mkdir(sampleStagingDir, { recursive: true });
+      await fs.promises.writeFile(path.join(sampleStagingDir, 'latest-file.txt'), 'latest content\n');
+
+      const archiveResult = await createArchive(sampleStagingDir, { outputDir: tempTestDir });
+      const archiveBuffer = await fs.promises.readFile(archiveResult.archivePath);
+      const targetRecoveryDir = path.join(tempTestDir, 'latest-recovery-target');
+
+      let getObjectKeyRequested = null;
+      const mockS3Client = {
+        send: async (command) => {
+          if (command instanceof ListObjectsV2Command) {
+            return {
+              Contents: [
+                {
+                  Key: 'backups/hermes-backup-2026-08-28_100000.tar.gz',
+                  Size: 1000,
+                  LastModified: new Date('2026-08-28T10:00:00Z'),
+                },
+                {
+                  Key: 'backups/hermes-backup-2026-08-29_200000.tar.gz',
+                  Size: 2000,
+                  LastModified: new Date('2026-08-29T20:00:00Z'),
+                },
+              ],
+              IsTruncated: false,
+            };
+          }
+          if (command instanceof GetObjectCommand) {
+            getObjectKeyRequested = command.input.Key;
+            return {
+              Body: archiveBuffer,
+              Metadata: { sha256: archiveResult.sha256 },
+            };
+          }
+        },
+      };
+
+      const result = await restoreCommand(
+        {
+          latest: true,
+          targetDir: targetRecoveryDir,
+        },
+        { config, io, s3Client: mockS3Client }
+      );
+
+      assert.equal(result.success, true);
+      assert.equal(result.exitCode, 0);
+      assert.equal(getObjectKeyRequested, 'backups/hermes-backup-2026-08-29_200000.tar.gz');
+      assert.ok(fs.existsSync(path.join(targetRecoveryDir, 'latest-file.txt')));
+    });
+  });
+
+  describe('verifyCommand execution', () => {
+    it('should execute verify in dry-run mode without downloading', async () => {
+      const io = createMockIo();
+      const config = {
+        ...validTestConfig,
+        hermesHome: mockHermesHome,
+        tempDir: tempTestDir,
+      };
+
+      const result = await verifyCommand({ dryRun: true, latest: true }, { config, io });
+
+      assert.equal(result.success, true);
+      assert.equal(result.exitCode, 0);
+      assert.equal(result.summary.dryRun, true);
+      assert.ok(io.getLogs().includes('[INFO] Starting Hermes archive verification...'));
+      assert.ok(io.getLogs().includes('[DRY-RUN] Simulating verification without downloading'));
+    });
+
+    it('should download and verify archive integrity end-to-end without touching HERMES_HOME', async () => {
+      const io = createMockIo();
+      const config = {
+        ...validTestConfig,
+        hermesHome: mockHermesHome,
+        tempDir: tempTestDir,
+      };
+
+      const sampleStagingDir = path.join(tempTestDir, 'verify-stage');
+      await fs.promises.mkdir(sampleStagingDir, { recursive: true });
+      await fs.promises.writeFile(path.join(sampleStagingDir, 'data.txt'), 'verify-content\n');
+
+      const sampleDb = path.join(sampleStagingDir, 'valid.db');
+      execFileSync('sqlite3', [
+        sampleDb,
+        'CREATE TABLE test_table (id INT); INSERT INTO test_table VALUES (1);',
+      ]);
+
+      const archiveResult = await createArchive(sampleStagingDir, { outputDir: tempTestDir });
+      const archiveBuffer = await fs.promises.readFile(archiveResult.archivePath);
+
+      // Record state of mockHermesHome before verification
+      const filesBefore = await fs.promises.readdir(mockHermesHome);
+
+      const mockS3Client = {
+        send: async (command) => {
+          if (command instanceof GetObjectCommand) {
+            return {
+              Body: archiveBuffer,
+              Metadata: { sha256: archiveResult.sha256 },
+              LastModified: new Date('2026-08-29T12:00:00Z'),
+            };
+          }
+        },
+      };
+
+      const result = await verifyCommand(
+        { archiveName: 'hermes-backup-2026-08-29_120000.tar.gz' },
+        { config, io, s3Client: mockS3Client }
+      );
+
+      assert.equal(result.success, true);
+      assert.equal(result.exitCode, 0);
+      assert.equal(result.summary.valid, true);
+      assert.ok(io.getLogs().includes('Archive verification completed successfully.'));
+
+      // Ensure mockHermesHome was untouched
+      const filesAfter = await fs.promises.readdir(mockHermesHome);
+      assert.deepEqual(filesBefore, filesAfter);
+    });
+
+    it('should fail verification if SQLite integrity check fails', async () => {
+      const io = createMockIo();
+      const config = {
+        ...validTestConfig,
+        hermesHome: mockHermesHome,
+        tempDir: tempTestDir,
+      };
+
+      const corruptStagingDir = path.join(tempTestDir, 'verify-corrupt-stage');
+      await fs.promises.mkdir(corruptStagingDir, { recursive: true });
+      await fs.promises.writeFile(
+        path.join(corruptStagingDir, 'bad.db'),
+        'Not a valid SQLite DB'
+      );
+
+      const archiveResult = await createArchive(corruptStagingDir, { outputDir: tempTestDir });
+      const archiveBuffer = await fs.promises.readFile(archiveResult.archivePath);
+
+      const mockS3Client = {
+        send: async () => ({
+          Body: archiveBuffer,
+          Metadata: { sha256: archiveResult.sha256 },
+        }),
+      };
+
+      const result = await verifyCommand(
+        { archiveName: 'corrupt-backup.tar.gz' },
+        { config, io, s3Client: mockS3Client }
+      );
+
+      assert.equal(result.success, false);
+      assert.equal(result.exitCode, 1);
+      assert.ok(io.getErrors().includes('SQLite integrity check failed'));
+    });
+  });
+
   describe('runCli top-level dispatcher', () => {
     it('should return exit code 0 on --help, -h, and empty arguments', async () => {
       const io = createMockIo();
@@ -728,6 +1230,34 @@ describe('CLI Dispatcher & Command Routing', () => {
       assert.equal(exit, 0);
       assert.ok(io.getLogs().includes('[INFO] Starting Hermes backup...'));
     });
+
+    it('should route to restoreCommand with options', async () => {
+      const io = createMockIo();
+      const config = {
+        ...validTestConfig,
+        hermesHome: mockHermesHome,
+        tempDir: tempTestDir,
+      };
+
+      const exit = await runCli(['restore', '--latest', '--dry-run'], { config, io });
+      assert.equal(exit, 0);
+      assert.ok(io.getLogs().includes('[INFO] Starting Hermes restore operation...'));
+      assert.ok(io.getLogs().includes('[DRY-RUN] Simulating restore without modifying local state'));
+    });
+
+    it('should route to verifyCommand with options', async () => {
+      const io = createMockIo();
+      const config = {
+        ...validTestConfig,
+        hermesHome: mockHermesHome,
+        tempDir: tempTestDir,
+      };
+
+      const exit = await runCli(['verify', '--latest', '--dry-run'], { config, io });
+      assert.equal(exit, 0);
+      assert.ok(io.getLogs().includes('[INFO] Starting Hermes archive verification...'));
+      assert.ok(io.getLogs().includes('[DRY-RUN] Simulating verification without downloading'));
+    });
   });
 
   describe('Index Module Re-exports', () => {
@@ -738,6 +1268,12 @@ describe('CLI Dispatcher & Command Routing', () => {
       assert.equal(typeof HermesBackup.backupCommand, 'function');
       assert.equal(typeof HermesBackup.testNotifyCommand, 'function');
       assert.equal(typeof HermesBackup.listCommand, 'function');
+      assert.equal(typeof HermesBackup.restoreCommand, 'function');
+      assert.equal(typeof HermesBackup.verifyCommand, 'function');
+      assert.equal(typeof HermesBackup.downloadBackup, 'function');
+      assert.equal(typeof HermesBackup.getLatestBackup, 'function');
+      assert.equal(typeof HermesBackup.unpackArchive, 'function');
+      assert.equal(typeof HermesBackup.createSafetySnapshot, 'function');
       assert.equal(typeof HermesBackup.getAvailableDiskSpace, 'function');
       assert.equal(typeof HermesBackup.verifyStorageCapacity, 'function');
       assert.equal(typeof HermesBackup.verifySqliteIntegrity, 'function');
@@ -750,6 +1286,8 @@ describe('CLI Dispatcher & Command Routing', () => {
       assert.equal(HermesBackup.COMMANDS.BACKUP, 'backup');
       assert.equal(HermesBackup.COMMANDS.TEST_NOTIFY, 'test-notify');
       assert.equal(HermesBackup.COMMANDS.LIST, 'list');
+      assert.equal(HermesBackup.COMMANDS.RESTORE, 'restore');
+      assert.equal(HermesBackup.COMMANDS.VERIFY, 'verify');
     });
   });
 

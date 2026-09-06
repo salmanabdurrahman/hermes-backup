@@ -21,6 +21,8 @@ Lightweight, dependency-minimal Node.js command-line utility for automated selec
   - [backup](#backup)
   - [test-notify](#test-notify)
   - [list](#list)
+  - [restore](#restore)
+  - [verify](#verify)
   - [Global Options & Exit Codes](#global-options--exit-codes)
 - [Automated Cron Scheduling](#automated-cron-scheduling)
   - [Crontab Configuration](#crontab-configuration)
@@ -298,15 +300,48 @@ node cli.js list
 node cli.js list --prefix "backups/hermes-backup-2026-"
 ```
 
+### `restore`
+
+Downloads a backup archive from Cloudflare R2, verifies its SHA-256 checksum, decrypts it if encrypted (via `BACKUP_ENCRYPTION_KEY`), unpacks into a recovery staging directory, validates SQLite structural integrity (`PRAGMA integrity_check;`), creates a pre-restore safety snapshot of active data, and synchronizes files to the destination directory:
+
+```bash
+# Restore the most recent backup archive to HERMES_HOME
+node cli.js restore --latest
+
+# Restore a specific backup archive to a custom recovery directory
+node cli.js restore hermes-backup-2026-08-29_120000.tar.gz --target-dir /tmp/recovered-hermes
+
+# Simulate restoration planning without modifying local state
+node cli.js restore --latest --dry-run
+```
+
+### `verify`
+
+Downloads and validates archive integrity end-to-end (SHA-256 verification, decryption, tar extraction, and SQLite `PRAGMA integrity_check`) within an isolated temporary sandbox without touching `HERMES_HOME` or writing to destination directories:
+
+```bash
+# Verify the newest backup in Cloudflare R2
+node cli.js verify --latest
+
+# Verify a specific backup archive
+node cli.js verify hermes-backup-2026-08-29_120000.tar.gz
+
+# Simulate verification in dry-run mode
+node cli.js verify --latest --dry-run
+```
+
 ### Global Options & Exit Codes
 
-| Flag                | Short | Description                                                    |
-| :------------------ | :---: | :------------------------------------------------------------- |
-| `--dry-run`         |       | Simulates execution without cloud writes or failure alerts     |
-| `--verbose`         | `-v`  | Enables detailed step-by-step progress logging                 |
-| `--help`            | `-h`  | Displays usage instructions and available subcommands          |
-| `--version`         | `-V`  | Displays CLI version                                           |
-| `--prefix <prefix>` |       | Prefix filter for listing remote backups (default: `backups/`) |
+| Flag                  | Short | Description                                                               |
+| :-------------------- | :---: | :------------------------------------------------------------------------ |
+| `--target-dir <path>` |       | Destination recovery directory for `restore` (default: `HERMES_HOME`)     |
+| `--latest`            |       | Selects the most recent backup archive from Cloudflare R2                 |
+| `--force`             |       | Overwrites destination files during `restore` without confirmation        |
+| `--dry-run`           |       | Simulates execution without cloud writes, disk changes, or failure alerts |
+| `--verbose`           | `-v`  | Enables detailed step-by-step progress logging                            |
+| `--help`              | `-h`  | Displays usage instructions and available subcommands                     |
+| `--version`           | `-V`  | Displays CLI version                                                      |
+| `--prefix <prefix>`   |       | Prefix filter for listing remote backups (default: `backups/`)            |
 
 #### POSIX Exit Codes
 

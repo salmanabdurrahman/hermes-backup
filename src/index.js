@@ -42,6 +42,8 @@ export {
   cleanupTempResources,
   registerProcessCleanup,
   withStagingCleanup,
+  unpackArchive,
+  createSafetySnapshot,
 } from './archiver.js';
 
 export {
@@ -49,7 +51,9 @@ export {
   formatBytes,
   createR2Client,
   uploadBackup,
+  downloadBackup,
   listBackups,
+  getLatestBackup,
   pruneExpiredBackups,
   formatBackupListTable,
 } from './storage.js';
@@ -96,5 +100,7 @@ export {
   backupCommand,
   testNotifyCommand,
   listCommand,
+  restoreCommand,
+  verifyCommand,
   runCli,
 } from './cli.js';

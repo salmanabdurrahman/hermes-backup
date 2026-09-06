@@ -427,3 +427,124 @@ export async function withStagingCleanup(stagingDir, actionFn, options = {}) {
     }
   }
 }
+
+/**
+ * Unpacks a compressed tar.gz archive into a target directory.
+ *
+ * @param {string} archivePath - Absolute or relative path to .tar.gz archive file
+ * @param {string} targetDir - Directory where contents will be extracted
+ * @param {object} [options]
+ * @returns {Promise<{
+ *   targetDir: string,
+ *   extractedCount: number,
+ *   entries: string[]
+ * }>}
+ */
+export async function unpackArchive(archivePath, targetDir, options = {}) {
+  if (!archivePath || typeof archivePath !== 'string') {
+    throw new Error('Archive path must be a non-empty string');
+  }
+  if (!targetDir || typeof targetDir !== 'string') {
+    throw new Error('Target directory must be a non-empty string');
+  }
+
+  const resolvedArchive = path.resolve(archivePath);
+  const resolvedTarget = path.resolve(targetDir);
+
+  let stat;
+  try {
+    stat = await fs.promises.stat(resolvedArchive);
+  } catch (err) {
+    throw new Error(`Archive file not found: ${resolvedArchive}`);
+  }
+
+  if (!stat.isFile() || stat.size === 0) {
+    throw new Error(`Archive is empty or not a regular file: ${resolvedArchive}`);
+  }
+
+  await fs.promises.mkdir(resolvedTarget, { recursive: true });
+
+  const entries = [];
+  await tar.x({
+    file: resolvedArchive,
+    cwd: resolvedTarget,
+    onentry: (entry) => {
+      entries.push(entry.path);
+    },
+  });
+
+  return {
+    targetDir: resolvedTarget,
+    extractedCount: entries.length,
+    entries,
+  };
+}
+
+/**
+ * Creates a safety snapshot of an existing target directory before restore operations.
+ * Returns null if the target directory does not exist or contains no files.
+ *
+ * @param {string} targetDir - Absolute or relative path to directory to snapshot
+ * @param {object} [options]
+ * @param {string} [options.tempDir] - Output directory for snapshot archive
+ * @param {string} [options.timestamp] - Specific timestamp string
+ * @returns {Promise<{
+ *   snapshotPath: string,
+ *   snapshotName: string,
+ *   size: number,
+ *   timestamp: string,
+ *   entryCount: number
+ * } | null>}
+ */
+export async function createSafetySnapshot(targetDir, options = {}) {
+  if (!targetDir || typeof targetDir !== 'string') {
+    throw new Error('Target directory path must be a non-empty string');
+  }
+
+  const resolvedTarget = path.resolve(targetDir);
+
+  let stat;
+  try {
+    stat = await fs.promises.stat(resolvedTarget);
+  } catch (err) {
+    if (err.code === 'ENOENT') {
+      return null;
+    }
+    throw err;
+  }
+
+  if (!stat.isDirectory()) {
+    throw new Error(`Target path is not a directory: ${resolvedTarget}`);
+  }
+
+  const entries = await fs.promises.readdir(resolvedTarget);
+  if (entries.length === 0) {
+    return null;
+  }
+
+  const tempDir = path.resolve(options.tempDir || os.tmpdir());
+  await fs.promises.mkdir(tempDir, { recursive: true });
+
+  const timestamp = options.timestamp || formatBackupTimestamp();
+  const snapshotName = `pre-restore-snapshot-${timestamp}.tar.gz`;
+  const snapshotPath = path.join(tempDir, snapshotName);
+
+  await tar.c(
+    {
+      gzip: true,
+      cwd: resolvedTarget,
+      portable: true,
+      file: snapshotPath,
+    },
+    entries
+  );
+
+  const snapshotStat = await fs.promises.stat(snapshotPath);
+  return {
+    snapshotPath,
+    snapshotName,
+    size: snapshotStat.size,
+    timestamp,
+    entryCount: entries.length,
+  };
+}
