@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
-import { execFile } from 'node:child_process';
+import { execFile, execFileSync } from 'node:child_process';
 import { promisify } from 'node:util';
 import {
   parseCliArgs,
@@ -42,7 +42,19 @@ describe('CLI Dispatcher & Command Routing', () => {
 
     const mnemosyneDataDir = path.join(mockHermesHome, 'mnemosyne', 'data');
     await fs.promises.mkdir(mnemosyneDataDir, { recursive: true });
-    await fs.promises.writeFile(path.join(mnemosyneDataDir, 'mnemosyne.db'), 'SQLite dummy db header');
+    const mnemosyneDbPath = path.join(mnemosyneDataDir, 'mnemosyne.db');
+    try {
+      execFileSync('sqlite3', [
+        mnemosyneDbPath,
+        `
+        PRAGMA journal_mode = WAL;
+        CREATE TABLE agent_memories (id INTEGER PRIMARY KEY, content TEXT);
+        INSERT INTO agent_memories (content) VALUES ('Mock memory content');
+        `,
+      ]);
+    } catch {
+      await fs.promises.writeFile(mnemosyneDbPath, 'SQLite dummy db header');
+    }
     await fs.promises.writeFile(path.join(mnemosyneDataDir, 'mnemosyne.db-wal'), 'SQLite WAL data');
     await fs.promises.writeFile(path.join(mnemosyneDataDir, 'mnemosyne.db-shm'), 'SQLite SHM index');
   });
@@ -323,6 +335,44 @@ describe('CLI Dispatcher & Command Routing', () => {
       assert.equal(result.exitCode, 1);
       assert.equal(fetchInvoked, false);
     });
+
+    it('should fail backup and dispatch alert when staged SQLite database fails integrity check', async () => {
+      const io = createMockIo();
+      const config = {
+        ...validTestConfig,
+        hermesHome: mockHermesHome,
+        tempDir: tempTestDir,
+      };
+
+      // Corrupt the database in Hermes home
+      const mnemosyneDir = path.join(mockHermesHome, 'mnemosyne', 'data');
+      await fs.promises.writeFile(path.join(mnemosyneDir, 'mnemosyne.db'), 'CORRUPTED_DB_BYTES');
+
+      let alertSent = false;
+      const mockFetch = async (url, options) => {
+        alertSent = true;
+        return {
+          ok: true,
+          status: 201,
+          json: async () => ({ messageId: '<integrity-alert-id>' }),
+        };
+      };
+
+      const result = await backupCommand(
+        { dryRun: false, verbose: true },
+        { config, io, fetch: mockFetch }
+      );
+
+      assert.equal(result.success, false);
+      assert.equal(result.exitCode, 1);
+      assert.ok(result.error);
+      assert.match(result.error.message, /SQLite integrity check failed for staged database/);
+      assert.equal(result.error.code, 'SQLITE_INTEGRITY_CHECK_FAILED');
+      assert.equal(alertSent, true);
+
+      const errors = io.getErrors();
+      assert.ok(errors.includes('[ERROR] Backup failed: SQLite integrity check failed for staged database: mnemosyne/data/mnemosyne.db'));
+    });
   });
 
   describe('testNotifyCommand execution', () => {
@@ -511,6 +561,7 @@ describe('CLI Dispatcher & Command Routing', () => {
       assert.equal(typeof HermesBackup.backupCommand, 'function');
       assert.equal(typeof HermesBackup.testNotifyCommand, 'function');
       assert.equal(typeof HermesBackup.listCommand, 'function');
+      assert.equal(typeof HermesBackup.verifySqliteIntegrity, 'function');
       assert.equal(typeof HermesBackup.runCli, 'function');
       assert.equal(HermesBackup.CLI_VERSION, '1.0.0');
       assert.equal(typeof HermesBackup.HELP_TEXT, 'string');

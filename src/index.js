@@ -26,6 +26,7 @@ export {
   createStagingDirectory,
   cleanStagingDirectory,
   stageLiveSqliteDatabase,
+  verifySqliteIntegrity,
   stageBackup,
 } from './stager.js';
 

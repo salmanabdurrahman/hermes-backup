@@ -19,6 +19,7 @@ import {
   createStagingDirectory,
   cleanStagingDirectory,
   stageLiveSqliteDatabase,
+  verifySqliteIntegrity,
   stageBackup,
 } from '../src/stager.js';
 
@@ -928,6 +929,176 @@ describe('Include-First Path Resolver & SQLite WAL Stager', () => {
       assert.ok(fs.existsSync(stagedStateDb));
       const content = await fs.promises.readFile(stagedStateDb, 'utf8');
       assert.equal(content, 'mock-state-db-data');
+
+      assert.equal(warnings.length, 1);
+      assert.match(warnings[0], /sqlite3 CLI not found on host/i);
+
+      await cleanStagingDirectory(stageResult.stagingDir, testTempDir);
+    });
+  });
+
+  describe('Post-Staging SQLite Structural Integrity Verification', () => {
+    it('should return true for a structurally intact database', async () => {
+      const dbPath = path.join(testTempDir, 'valid.db');
+      execFileSync('sqlite3', [
+        dbPath,
+        `
+        PRAGMA journal_mode = WAL;
+        CREATE TABLE test_data (id INTEGER PRIMARY KEY, note TEXT);
+        INSERT INTO test_data (note) VALUES ('integrity-verified');
+        `,
+      ]);
+
+      const result = await verifySqliteIntegrity(dbPath);
+      assert.equal(result, true);
+    });
+
+    it('should return false for a corrupt or invalid database file', async () => {
+      const corruptDbPath = path.join(testTempDir, 'corrupt.db');
+      await fs.promises.writeFile(corruptDbPath, 'NOT_A_VALID_SQLITE_DATABASE_HEADER');
+
+      const result = await verifySqliteIntegrity(corruptDbPath);
+      assert.equal(result, false);
+    });
+
+    it('should return false when integrity check outputs error messages instead of ok', async () => {
+      const dbPath = path.join(testTempDir, 'mock_err.db');
+      await fs.promises.writeFile(dbPath, 'dummy-data');
+
+      const mockExecFn = async () => ({
+        stdout: '*** in database main ***\nPage 4: b-tree cell corruption\n',
+      });
+
+      const result = await verifySqliteIntegrity(dbPath, {
+        execFileAsync: mockExecFn,
+      });
+      assert.equal(result, false);
+    });
+
+    it('should pass safely and trigger warning when sqlite3 binary is missing (ENOENT)', async () => {
+      const dbPath = path.join(testTempDir, 'mock.db');
+      await fs.promises.writeFile(dbPath, 'dummy-data');
+
+      let warnedMsg = null;
+      const result = await verifySqliteIntegrity(dbPath, {
+        sqliteBinary: 'nonexistent-sqlite3-binary',
+        onWarning: (msg) => {
+          warnedMsg = msg;
+        },
+      });
+
+      assert.equal(result, true);
+      assert.ok(warnedMsg);
+      assert.match(warnedMsg, /sqlite3 CLI not found on host/i);
+    });
+
+    it('should return false when child process throws non-ENOENT error', async () => {
+      const dbPath = path.join(testTempDir, 'io_err.db');
+      await fs.promises.writeFile(dbPath, 'dummy-data');
+
+      const mockExecFn = async () => {
+        const err = new Error('Disk read error');
+        err.code = 'EIO';
+        throw err;
+      };
+
+      const result = await verifySqliteIntegrity(dbPath, {
+        execFileAsync: mockExecFn,
+      });
+      assert.equal(result, false);
+    });
+
+    it('should abort staging and clean up staging directory when a staged .db file fails integrity check', async () => {
+      // Set up a valid config and a corrupt database file inside Hermes home
+      await fs.promises.writeFile(path.join(mockHermesHome, 'config.yaml'), 'sample: config\n');
+      const mnemosyneDir = path.join(mockHermesHome, 'mnemosyne', 'data');
+      await fs.promises.mkdir(mnemosyneDir, { recursive: true });
+      const mnemosyneDb = path.join(mnemosyneDir, 'mnemosyne.db');
+      await fs.promises.writeFile(mnemosyneDb, 'CORRUPTED_DATABASE_CONTENTS');
+
+      let caughtError = null;
+      try {
+        await stageBackup(mockHermesHome, { tempDir: testTempDir });
+      } catch (err) {
+        caughtError = err;
+      }
+
+      assert.ok(caughtError, 'Staging must reject on integrity check failure');
+      assert.equal(caughtError.code, 'SQLITE_INTEGRITY_CHECK_FAILED');
+      assert.match(caughtError.message, /SQLite integrity check failed for staged database/);
+
+      // Verify staging directory was cleaned up
+      const tempEntries = await fs.promises.readdir(testTempDir);
+      const leftoverStaging = tempEntries.filter((e) => e.startsWith('hermes-backup-'));
+      assert.equal(leftoverStaging.length, 0, 'Staging directory must be cleaned up on failure');
+    });
+
+    it('should stage multiple valid databases successfully and verify all of them', async () => {
+      const mnemosyneDir = path.join(mockHermesHome, 'mnemosyne', 'data');
+      await fs.promises.mkdir(mnemosyneDir, { recursive: true });
+      const mnemosyneDb = path.join(mnemosyneDir, 'mnemosyne.db');
+      execFileSync('sqlite3', [
+        mnemosyneDb,
+        `
+        PRAGMA journal_mode = WAL;
+        CREATE TABLE memories (id INTEGER PRIMARY KEY, note TEXT);
+        INSERT INTO memories VALUES (1, 'recalled memory');
+        `,
+      ]);
+
+      const cronDir = path.join(mockHermesHome, 'cron');
+      await fs.promises.mkdir(cronDir, { recursive: true });
+      const executionsDb = path.join(cronDir, 'executions.db');
+      execFileSync('sqlite3', [
+        executionsDb,
+        `
+        PRAGMA journal_mode = WAL;
+        CREATE TABLE jobs (id INTEGER PRIMARY KEY, run TEXT);
+        INSERT INTO jobs VALUES (1, 'backup-run');
+        `,
+      ]);
+
+      const stateDb = path.join(mockHermesHome, 'state.db');
+      execFileSync('sqlite3', [
+        stateDb,
+        `
+        PRAGMA journal_mode = WAL;
+        CREATE TABLE state_items (id INTEGER PRIMARY KEY, active INT);
+        INSERT INTO state_items VALUES (1, 1);
+        `,
+      ]);
+
+      const stageResult = await stageBackup(mockHermesHome, { tempDir: testTempDir });
+      assert.ok(stageResult.stagingDir);
+      assert.equal(stageResult.dryRun, false);
+
+      const stagedMnemosyne = path.join(stageResult.stagingDir, 'mnemosyne/data/mnemosyne.db');
+      const stagedExecutions = path.join(stageResult.stagingDir, 'cron/executions.db');
+      const stagedState = path.join(stageResult.stagingDir, 'state.db');
+
+      assert.ok(fs.existsSync(stagedMnemosyne));
+      assert.ok(fs.existsSync(stagedExecutions));
+      assert.ok(fs.existsSync(stagedState));
+
+      await cleanStagingDirectory(stageResult.stagingDir, testTempDir);
+    });
+
+    it('should safely bypass post-staging integrity check when sqlite3 binary is missing', async () => {
+      const mnemosyneDir = path.join(mockHermesHome, 'mnemosyne', 'data');
+      await fs.promises.mkdir(mnemosyneDir, { recursive: true });
+      const mnemosyneDb = path.join(mnemosyneDir, 'mnemosyne.db');
+      await fs.promises.writeFile(mnemosyneDb, 'mock-db-binary-bytes');
+
+      const warnings = [];
+      const stageResult = await stageBackup(mockHermesHome, {
+        tempDir: testTempDir,
+        sqliteBinary: 'nonexistent-sqlite3-cli-bin',
+        onWarning: (msg) => warnings.push(msg),
+      });
+
+      assert.ok(stageResult.stagingDir);
+      const stagedDb = path.join(stageResult.stagingDir, 'mnemosyne/data/mnemosyne.db');
+      assert.ok(fs.existsSync(stagedDb));
 
       assert.equal(warnings.length, 1);
       assert.match(warnings[0], /sqlite3 CLI not found on host/i);

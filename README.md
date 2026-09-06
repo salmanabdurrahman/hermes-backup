@@ -126,6 +126,7 @@ Hermes Backup CLI provides comprehensive WAL protection:
 
 1. **Generic Triad Discovery**: Automatically detects when any `.db` file (e.g. `mnemosyne.db`, `kanban.db`, `executions.db`) has an active `-wal` or `-shm` companion file and copies companion files into the staging directory.
 2. **Atomic Online Backup for `state.db`**: For high-write operational databases (`state.db`), Hermes Backup CLI performs an online snapshot via the SQLite `.backup` command with `.bail on`. This flushes active WAL transactions into a single, self-contained, crash-consistent database without risking dirty reads, torn writes, or WAL companion mismatches. If the `sqlite3` CLI binary is not installed on the host, it logs a warning and falls back to direct file staging. If the database is corrupt or encounters lock contention or I/O errors, execution halts with a structured error to prevent false-success backups of damaged state.
+3. **Post-Staging Structural Integrity Verification**: Prior to archive compression, Hermes Backup CLI executes `PRAGMA integrity_check;` across all staged `.db` files. If any database fails integrity check (corruption, malformed pages, or truncated records), staging aborts with a structured fail-closed error and cleans up temporary resources before archive packaging begins. If the `sqlite3` binary is absent on the host, the verification safely passes with a warning.
 
 ## Prerequisites
 
@@ -255,11 +256,12 @@ Executes the complete backup lifecycle:
 1. Validates configuration and verifies `HERMES_HOME`.
 2. Creates an isolated staging directory in `/tmp/hermes-backup-<timestamp>`.
 3. Discovers whitelisted files and stages SQLite databases with active WAL companions.
-4. Compresses staging data into `hermes-backup-YYYY-MM-DD_HHmmss.tar.gz`.
-5. Uploads archive to Cloudflare R2 with metadata.
-6. Prunes remote backups older than `BACKUP_RETENTION_DAYS` (default 3 days).
-7. Cleans temporary staging files and local archive.
-8. On failure: catches error, sanitizes credentials, dispatches Brevo alert email, cleans staging resources, and exits with code `1`.
+4. Verifies structural integrity of all staged SQLite databases (`PRAGMA integrity_check;`).
+5. Compresses staging data into `hermes-backup-YYYY-MM-DD_HHmmss.tar.gz`.
+6. Uploads archive to Cloudflare R2 with metadata.
+7. Prunes remote backups older than `BACKUP_RETENTION_DAYS` (default 3 days).
+8. Cleans temporary staging files and local archive.
+9. On failure: catches error, sanitizes credentials, dispatches Brevo alert email, cleans staging resources, and exits with code `1`.
 
 ```bash
 # Execute standard backup

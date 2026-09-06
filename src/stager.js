@@ -615,6 +615,44 @@ export async function cleanStagingDirectory(stagingDir, tempDir = '/tmp') {
 }
 
 /**
+ * Verifies structural integrity of a staged SQLite database file.
+ * Runs PRAGMA integrity_check; and validates output equals 'ok'.
+ * If sqlite3 CLI is absent (ENOENT), passes safely with warning.
+ *
+ * @param {string} dbPath - Absolute path to staged .db file
+ * @param {object} [options]
+ * @param {string} [options.sqliteBinary='sqlite3'] - SQLite CLI binary name or path
+ * @param {Function} [options.execFileAsync] - Optional child_process execFile runner
+ * @param {(message: string) => void} [options.onWarning] - Callback invoked when CLI is missing
+ * @returns {Promise<boolean>} True if database is structurally intact or CLI is absent
+ */
+export async function verifySqliteIntegrity(dbPath, options = {}) {
+  const {
+    sqliteBinary = 'sqlite3',
+    execFileAsync: execFn = execFileAsync,
+    onWarning,
+  } = options;
+
+  try {
+    const { stdout } = await execFn(sqliteBinary, [
+      dbPath,
+      'PRAGMA integrity_check;',
+    ]);
+    return typeof stdout === 'string' && stdout.trim() === 'ok';
+  } catch (err) {
+    if (err && err.code === 'ENOENT') {
+      if (typeof onWarning === 'function') {
+        onWarning(
+          'sqlite3 CLI not found on host. Skipping SQLite integrity check.'
+        );
+      }
+      return true;
+    }
+    return false;
+  }
+}
+
+/**
  * Stages a live SQLite database file using atomic online backup (.backup command)
  * to guarantee transaction consistency and flush active WAL data.
  * Falls back to standard copyFile strictly when sqlite3 CLI is absent (ENOENT).
@@ -705,6 +743,17 @@ export async function stageBackup(hermesHome, options = {}) {
     execFileAsync: execFn,
   } = options;
 
+  let warnedMissingCli = false;
+  const stageWarning = (msg) => {
+    if (typeof onWarning === 'function') {
+      if (typeof msg === 'string' && msg.includes('sqlite3 CLI not found')) {
+        if (warnedMissingCli) return;
+        warnedMissingCli = true;
+      }
+      onWarning(msg);
+    }
+  };
+
   const timestamp = formatBackupTimestamp();
   const resolvedFiles = await resolveBackupPaths(hermesHome, { whitelist });
 
@@ -741,7 +790,7 @@ export async function stageBackup(hermesHome, options = {}) {
 
       if (path.posix.basename(file.relativePath) === 'state.db') {
         await stageLiveSqliteDatabase(file.absolutePath, destPath, {
-          onWarning,
+          onWarning: stageWarning,
           sqliteBinary,
           execFileAsync: execFn,
         });
@@ -757,6 +806,47 @@ export async function stageBackup(hermesHome, options = {}) {
         destPath,
         size: stagedStat.size,
       });
+    }
+
+    // Verify post-staging SQLite structural integrity across all staged .db files
+    for (const stagedFile of stagedFiles) {
+      if (stagedFile.destPath && stagedFile.relativePath.toLowerCase().endsWith('.db')) {
+        const walPath = `${stagedFile.destPath}-wal`;
+        const shmPath = `${stagedFile.destPath}-shm`;
+        const walExisted = fs.existsSync(walPath);
+        const shmExisted = fs.existsSync(shmPath);
+
+        const isValid = await verifySqliteIntegrity(stagedFile.destPath, {
+          sqliteBinary,
+          execFileAsync: execFn,
+          onWarning: stageWarning,
+        });
+
+        // Clean up transient companion files created by sqlite3 during integrity check
+        // if they were not originally staged (e.g. state.db companions)
+        if (!walExisted && fs.existsSync(walPath)) {
+          try {
+            await fs.promises.unlink(walPath);
+          } catch {
+            // Ignore cleanup error
+          }
+        }
+        if (!shmExisted && fs.existsSync(shmPath)) {
+          try {
+            await fs.promises.unlink(shmPath);
+          } catch {
+            // Ignore cleanup error
+          }
+        }
+
+        if (!isValid) {
+          const error = new Error(
+            `SQLite integrity check failed for staged database: ${stagedFile.relativePath}`
+          );
+          error.code = 'SQLITE_INTEGRITY_CHECK_FAILED';
+          throw error;
+        }
+      }
     }
 
     return {

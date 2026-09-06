@@ -195,6 +195,13 @@ export async function backupCommand(options = {}, context = {}) {
     const stageResult = await stageBackup(config.hermesHome, {
       tempDir: config.tempDir,
       dryRun,
+      onWarning: (msg) => {
+        if (typeof io.warn === 'function') {
+          io.warn(`[WARN] ${msg}`);
+        } else {
+          log(`[WARN] ${msg}`);
+        }
+      },
     });
 
     stagingDir = stageResult.stagingDir;
@@ -203,6 +210,9 @@ export async function backupCommand(options = {}, context = {}) {
       `[INFO] Discovered ${stageResult.fileCount} files (${formatBytes(stageResult.totalBytes)})`
     );
     log('[INFO] Staged SQLite databases with WAL companion files');
+    if (!dryRun) {
+      logVerbose('[INFO] Verified SQLite structural integrity across staged databases');
+    }
 
     if (verbose) {
       for (const item of stageResult.stagedFiles) {

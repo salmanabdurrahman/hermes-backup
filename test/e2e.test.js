@@ -244,10 +244,18 @@ describe('End-to-End Integration Test Suite & Mock VPS Validation', () => {
     // 13. Backups/mnemosyne directory (MUST BE INCLUDED unlike backups/*.zip)
     const mnemosyneBackupDir = path.join(targetHome, 'backups', 'mnemosyne');
     await fs.promises.mkdir(mnemosyneBackupDir, { recursive: true });
-    await fs.promises.writeFile(
-      path.join(mnemosyneBackupDir, 'snapshot_2026-08-28.db'),
-      'sqlite-snapshot-backup-data'
-    );
+    const snapshotDbPath = path.join(mnemosyneBackupDir, 'snapshot_2026-08-28.db');
+    try {
+      execFileSync('sqlite3', [
+        snapshotDbPath,
+        `
+        CREATE TABLE snapshot_meta (id INTEGER PRIMARY KEY, note TEXT);
+        INSERT INTO snapshot_meta VALUES (1, 'snapshot-data');
+        `,
+      ]);
+    } catch {
+      await fs.promises.writeFile(snapshotDbPath, 'sqlite-snapshot-backup-data');
+    }
 
     // 14. Context cache, channel directory, prompt snapshot, state db
     await fs.promises.writeFile(path.join(targetHome, 'context_length_cache.yaml'), 'claude: 200000\n');
