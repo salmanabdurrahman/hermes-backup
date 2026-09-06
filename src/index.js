@@ -36,6 +36,7 @@ export {
   generateArchiveName,
   createArchive,
   createArchiveStream,
+  calculateFileSha256,
   validateArchive,
   cleanupArchive,
   cleanupTempResources,

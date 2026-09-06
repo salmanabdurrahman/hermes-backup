@@ -40,8 +40,8 @@ Hermes Backup CLI extracts only critical agent state (~80MB uncompressed), stage
 
 - **Selective Include-First Extraction**: Captures vital memories, configuration, credentials, custom skills, and cron databases while skipping regenerable models and virtual environments.
 - **Generic SQLite WAL-Safe Staging**: Dynamically discovers `.db` databases across whitelisted directories and copies active companion `-wal` and `-shm` files to guarantee snapshot consistency without locking active agent processes.
-- **Streaming Tar Gzip Packaging**: Generates timestamped `hermes-backup-YYYY-MM-DD_HHmmss.tar.gz` archives with size validation and zero-byte safety gates.
-- **Cloudflare R2 S3 Integration**: Uploads archives directly to S3-compatible Cloudflare R2 buckets with custom object metadata (`hostname`, `timestamp`, `uncompressed-size`).
+- **Streaming Tar Gzip Packaging**: Generates timestamped `hermes-backup-YYYY-MM-DD_HHmmss.tar.gz` archives with concurrent SHA-256 stream calculation, size validation, and zero-byte safety gates.
+- **Cloudflare R2 S3 Integration**: Uploads archives directly to S3-compatible Cloudflare R2 buckets using in-memory buffer retry resilience with custom cryptographic object metadata (`hostname`, `timestamp`, `uncompressed-size`, `sha256`).
 - **Automated 3-Day Retention Pruning**: Automatically purges remote backups older than `BACKUP_RETENTION_DAYS` (default 3 days) after each successful upload to keep storage usage minimal.
 - **Zero Silent Failures**: Dispatches transactional alert emails via Brevo REST API (`POST /v3/smtp/email`) upon any uncaught runtime error or network failure.
 - **Dynamic Secret Redaction**: Automatically sanitizes error messages and stack traces, replacing sensitive `.env` credential values (>4 characters) with `[REDACTED]`.

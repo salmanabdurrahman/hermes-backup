@@ -3,12 +3,14 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
+import crypto from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import { Readable } from 'node:stream';
 import {
   generateArchiveName,
   createArchive,
   createArchiveStream,
+  calculateFileSha256,
   validateArchive,
   cleanupArchive,
   cleanupTempResources,
@@ -106,6 +108,14 @@ describe('Streaming tar.gz Archiver & Staging Cleanup Engine', () => {
       assert.equal(archiveResult.timestamp, '2026-08-29_100000');
       assert.ok(fs.existsSync(archiveResult.archivePath));
 
+      // Validate cryptographic SHA-256 returned by streaming compression
+      assert.ok(typeof archiveResult.sha256 === 'string' && archiveResult.sha256.length === 64);
+      const expectedArchiveSha = crypto
+        .createHash('sha256')
+        .update(await fs.promises.readFile(archiveResult.archivePath))
+        .digest('hex');
+      assert.equal(archiveResult.sha256, expectedArchiveSha);
+
       // Validate archive using validateArchive
       const validation = await validateArchive(archiveResult.archivePath);
       assert.equal(validation.valid, true);
@@ -128,6 +138,46 @@ describe('Streaming tar.gz Archiver & Staging Cleanup Engine', () => {
       assert.equal(restoredConfig, 'model: hermes\ntemperature: 0.7');
       assert.equal(restoredMemory, '# Long-Term Memory Profile');
       assert.equal(restoredDb, 'sqlite-binary-data');
+    });
+
+    it('should stream SHA-256 hash calculation concurrently during compression', async () => {
+      await fs.promises.writeFile(path.join(mockStagingDir, 'SOUL.md'), '# Hermes AI Persona Data');
+      await fs.promises.mkdir(path.join(mockStagingDir, 'data'), { recursive: true });
+      await fs.promises.writeFile(path.join(mockStagingDir, 'data/records.json'), JSON.stringify({ count: 42 }));
+
+      const archive = await createArchive(mockStagingDir, {
+        outputDir: testTempDir,
+      });
+
+      assert.ok(archive.sha256);
+      assert.equal(archive.sha256.length, 64);
+
+      // Verify checksum independently from disk file
+      const diskChecksum = await calculateFileSha256(archive.archivePath);
+      assert.equal(archive.sha256, diskChecksum);
+    });
+
+    it('should compute cryptographic SHA-256 checksum of existing file and reject invalid input', async () => {
+      const sampleFile = path.join(testTempDir, 'checksum-sample.txt');
+      const sampleContent = 'deterministic cryptographic payload verification';
+      await fs.promises.writeFile(sampleFile, sampleContent);
+
+      const expectedDigest = crypto.createHash('sha256').update(sampleContent).digest('hex');
+      const actualDigest = await calculateFileSha256(sampleFile);
+      assert.equal(actualDigest, expectedDigest);
+
+      await assert.rejects(
+        () => calculateFileSha256(null),
+        (err) => err.message.includes('File path must be a non-empty string')
+      );
+      await assert.rejects(
+        () => calculateFileSha256(''),
+        (err) => err.message.includes('File path must be a non-empty string')
+      );
+      await assert.rejects(
+        () => calculateFileSha256(path.join(testTempDir, 'non-existent-file.bin')),
+        (err) => err.code === 'ENOENT'
+      );
     });
 
     it('should create a readable archive stream', async () => {

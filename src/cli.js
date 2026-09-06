@@ -283,6 +283,7 @@ export async function backupCommand(options = {}, context = {}) {
       uploadResult = await uploadBackup(archivePath, config, {
         client: s3Client,
         uncompressedSize: stageResult.totalBytes,
+        sha256: archiveResult?.sha256,
       });
 
       const durationSec = ((Date.now() - uploadStart) / 1000).toFixed(1);

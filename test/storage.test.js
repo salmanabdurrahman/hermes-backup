@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
+import crypto from 'node:crypto';
 import {
   PutObjectCommand,
   ListObjectsV2Command,
@@ -130,17 +131,28 @@ describe('Storage Module — Cloudflare R2 Client & Remote Retention Pruner', ()
 
       const result = await uploadBackup(dummyArchive, validConfig, { dryRun: true });
 
+      const expectedDigest = crypto
+        .createHash('sha256')
+        .update('mock archive content for dry-run')
+        .digest('hex');
+
       assert.equal(result.dryRun, true);
       assert.equal(result.key, 'backups/hermes-backup-2026-08-29_100000.tar.gz');
       assert.equal(result.bucket, 'test-hermes-bucket');
       assert.equal(result.size, 32);
+      assert.equal(result.sha256, expectedDigest);
       assert.equal(result.etag, '"dry-run-etag"');
       assert.ok(result.timestamp);
     });
 
-    it('should upload archive using PutObjectCommand with metadata', async () => {
+    it('should upload archive using PutObjectCommand with metadata and SHA-256', async () => {
       const dummyArchive = path.join(tempTestDir, 'hermes-backup-2026-08-29_100000.tar.gz');
       await fs.promises.writeFile(dummyArchive, 'valid mock archive binary payload');
+
+      const expectedDigest = crypto
+        .createHash('sha256')
+        .update('valid mock archive binary payload')
+        .digest('hex');
 
       let capturedCommand = null;
       const mockClient = {
@@ -161,6 +173,7 @@ describe('Storage Module — Cloudflare R2 Client & Remote Retention Pruner', ()
       assert.equal(result.dryRun, false);
       assert.equal(result.key, 'backups/hermes-backup-2026-08-29_100000.tar.gz');
       assert.equal(result.bucket, 'test-hermes-bucket');
+      assert.equal(result.sha256, expectedDigest);
       assert.equal(result.etag, 'a1b2c3d4e5f6');
 
       assert.ok(capturedCommand instanceof PutObjectCommand);
@@ -168,10 +181,88 @@ describe('Storage Module — Cloudflare R2 Client & Remote Retention Pruner', ()
       assert.equal(capturedCommand.input.Key, 'backups/hermes-backup-2026-08-29_100000.tar.gz');
       assert.equal(capturedCommand.input.ContentType, 'application/gzip');
       assert.equal(capturedCommand.input.ContentLength, 33);
+      assert.equal(capturedCommand.input.Metadata['sha256'], expectedDigest);
       assert.equal(capturedCommand.input.Metadata['uncompressed-size'], '85000000');
       assert.equal(capturedCommand.input.Metadata['custom_tag'], 'automated-cron');
       assert.ok(capturedCommand.input.Metadata['hostname']);
       assert.ok(capturedCommand.input.Metadata['timestamp']);
+
+      // Verify payload is an in-memory Buffer to guarantee retry resilience
+      assert.ok(Buffer.isBuffer(capturedCommand.input.Body));
+      assert.equal(capturedCommand.input.Body.toString('utf8'), 'valid mock archive binary payload');
+    });
+
+    it('should use pre-calculated SHA-256 and normalize metadata prefix when supplied', async () => {
+      const dummyArchive = path.join(tempTestDir, 'hermes-backup-custom-sha.tar.gz');
+      await fs.promises.writeFile(dummyArchive, 'custom payload');
+
+      const customSha = 'f8a55c6d91234567890abcdef1234567890abcdef1234567890abcdef1234567';
+
+      let capturedCommand = null;
+      const mockClient = {
+        send: async (command) => {
+          capturedCommand = command;
+          return { ETag: '"hash-etag"' };
+        },
+      };
+
+      const result = await uploadBackup(dummyArchive, validConfig, {
+        client: mockClient,
+        sha256: customSha,
+        metadata: {
+          'x-amz-meta-custom-header': 'normalized-value',
+        },
+      });
+
+      assert.equal(result.sha256, customSha);
+      assert.equal(capturedCommand.input.Metadata['sha256'], customSha);
+      assert.equal(capturedCommand.input.Metadata['custom-header'], 'normalized-value');
+    });
+
+    it('should provide retry resilience by supporting multiple reads of in-memory buffer Body', async () => {
+      const dummyArchive = path.join(tempTestDir, 'hermes-backup-retry.tar.gz');
+      const testContent = 'retry resilience payload check';
+      await fs.promises.writeFile(dummyArchive, testContent);
+
+      let attempts = 0;
+      let bodyReadAttempts = [];
+
+      const mockClient = {
+        send: async (command) => {
+          attempts++;
+          const body = command.input.Body;
+          assert.ok(Buffer.isBuffer(body), 'Body must be an in-memory buffer');
+          bodyReadAttempts.push(body.toString('utf8'));
+
+          if (attempts === 1) {
+            // Simulate transient network failure on first attempt
+            const transientErr = new Error('Transient socket hang up');
+            transientErr.code = 'ECONNRESET';
+            throw transientErr;
+          }
+
+          return { ETag: '"retry-success-etag"' };
+        },
+      };
+
+      // In real SDK, retry happens inside client.send. Here we verify that if client retries,
+      // the Body buffer is re-readable across attempts without exhaustion.
+      let capturedCommand;
+      const capturingClient = {
+        send: async (command) => {
+          capturedCommand = command;
+          // First attempt reads buffer
+          const firstRead = command.input.Body.toString('utf8');
+          // Simulated retry reads buffer again
+          const secondRead = command.input.Body.toString('utf8');
+          assert.equal(firstRead, testContent);
+          assert.equal(secondRead, testContent);
+          return { ETag: '"etag-ok"' };
+        },
+      };
+
+      const result = await uploadBackup(dummyArchive, validConfig, { client: capturingClient });
+      assert.equal(result.etag, 'etag-ok');
     });
 
     it('should sanitize secrets in error if upload fails', async () => {

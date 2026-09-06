@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import https from 'node:https';
+import crypto from 'node:crypto';
 import {
   S3Client,
   PutObjectCommand,
@@ -81,12 +82,14 @@ export function createR2Client(config, clientOverrides = {}) {
  * @param {string} [options.key] - Custom S3 object key (defaults to backups/<filename>)
  * @param {Record<string, string>} [options.metadata] - Custom metadata fields
  * @param {number} [options.uncompressedSize] - Uncompressed size in bytes for metadata
+ * @param {string} [options.sha256] - Pre-calculated SHA-256 checksum (computed from file if omitted)
  * @param {string} [options.contentType='application/gzip'] - MIME content type
  * @param {boolean} [options.dryRun=false] - If true, skips network upload
  * @returns {Promise<{
  *   key: string,
  *   bucket: string,
  *   size: number,
+ *   sha256: string,
  *   etag: string,
  *   timestamp: string,
  *   dryRun: boolean
@@ -99,6 +102,7 @@ export async function uploadBackup(archivePath, config, options = {}) {
     key: customKey,
     metadata = {},
     uncompressedSize,
+    sha256: customSha256,
     contentType = 'application/gzip',
     dryRun = false,
   } = options;
@@ -126,11 +130,17 @@ export async function uploadBackup(archivePath, config, options = {}) {
   const objectKey = customKey || `backups/${archiveBasename}`;
   const nowIso = new Date().toISOString();
 
+  // Load payload into in-memory buffer to prevent AWS SDK v3 stream rewind hangs on retries
+  const fileBuffer = await fs.promises.readFile(resolvedPath);
+  const calculatedSha256 = crypto.createHash('sha256').update(fileBuffer).digest('hex');
+  const finalSha256 = customSha256 || calculatedSha256;
+
   if (dryRun) {
     return {
       key: objectKey,
       bucket: bucketName,
       size: fileStat.size,
+      sha256: finalSha256,
       etag: '"dry-run-etag"',
       timestamp: nowIso,
       dryRun: true,
@@ -142,6 +152,7 @@ export async function uploadBackup(archivePath, config, options = {}) {
   const mergedMetadata = {
     hostname: os.hostname(),
     timestamp: nowIso,
+    sha256: finalSha256,
     ...(typeof uncompressedSize === 'number' && uncompressedSize >= 0
       ? { 'uncompressed-size': String(uncompressedSize) }
       : {}),
@@ -152,16 +163,18 @@ export async function uploadBackup(archivePath, config, options = {}) {
   const stringMetadata = {};
   for (const [k, v] of Object.entries(mergedMetadata)) {
     if (v !== undefined && v !== null) {
-      stringMetadata[k.toLowerCase()] = String(v);
+      const normalizedKey = k.toLowerCase().replace(/^x-amz-meta-/, '');
+      stringMetadata[normalizedKey] = String(v);
     }
   }
 
-  const fileStream = fs.createReadStream(resolvedPath);
+  // Ensure sha256 metadata is explicitly set
+  stringMetadata.sha256 = String(finalSha256);
 
   const command = new PutObjectCommand({
     Bucket: bucketName,
     Key: objectKey,
-    Body: fileStream,
+    Body: fileBuffer,
     ContentLength: fileStat.size,
     ContentType: contentType,
     Metadata: stringMetadata,
@@ -175,6 +188,7 @@ export async function uploadBackup(archivePath, config, options = {}) {
       key: objectKey,
       bucket: bucketName,
       size: fileStat.size,
+      sha256: finalSha256,
       etag,
       timestamp: nowIso,
       dryRun: false,

@@ -1,6 +1,9 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
+import crypto from 'node:crypto';
+import { Transform } from 'node:stream';
+import { pipeline } from 'node:stream/promises';
 import * as tar from 'tar';
 import { formatBackupTimestamp, cleanStagingDirectory } from './stager.js';
 
@@ -21,6 +24,25 @@ export function generateArchiveName(timestampOrDate) {
     timestamp = formatBackupTimestamp();
   }
   return `hermes-backup-${timestamp}.tar.gz`;
+}
+
+/**
+ * Computes the cryptographic SHA-256 checksum of a file via streaming.
+ *
+ * @param {string} filePath - Path to the file
+ * @returns {Promise<string>} Hex-encoded SHA-256 digest
+ */
+export async function calculateFileSha256(filePath) {
+  if (!filePath || typeof filePath !== 'string') {
+    throw new Error('File path must be a non-empty string');
+  }
+
+  const resolved = path.resolve(filePath);
+  const hash = crypto.createHash('sha256');
+  const fileStream = fs.createReadStream(resolved);
+
+  await pipeline(fileStream, hash);
+  return hash.digest('hex');
 }
 
 /**
@@ -70,6 +92,7 @@ async function validateStagingDirectory(stagingDir) {
  *   archivePath: string,
  *   archiveName: string,
  *   size: number,
+ *   sha256: string,
  *   timestamp: string,
  *   entryCount: number
  * }>}
@@ -88,16 +111,28 @@ export async function createArchive(stagingDir, options = {}) {
 
   const useGzip = options.gzip !== false;
 
+  const hash = crypto.createHash('sha256');
+  const hashStream = new Transform({
+    transform(chunk, encoding, callback) {
+      hash.update(chunk);
+      callback(null, chunk);
+    },
+  });
+
+  const tarStream = tar.c(
+    {
+      gzip: useGzip,
+      cwd: resolvedStaging,
+      portable: true,
+    },
+    entries
+  );
+
+  const fileWriteStream = fs.createWriteStream(archivePath);
+
   try {
-    await tar.c(
-      {
-        gzip: useGzip,
-        file: archivePath,
-        cwd: resolvedStaging,
-        portable: true,
-      },
-      entries
-    );
+    await pipeline(tarStream, hashStream, fileWriteStream);
+    const sha256 = hash.digest('hex');
 
     let stat;
     try {
@@ -119,6 +154,7 @@ export async function createArchive(stagingDir, options = {}) {
       archivePath,
       archiveName,
       size: stat.size,
+      sha256,
       timestamp,
       entryCount: entries.length,
     };
