@@ -1,5 +1,7 @@
 # Hermes Backup CLI
 
+[![CI](https://github.com/salmanabdurrahman/hermes-backup/actions/workflows/ci.yml/badge.svg)](https://github.com/salmanabdurrahman/hermes-backup/actions/workflows/ci.yml)
+
 Lightweight, dependency-minimal Node.js command-line utility for automated selective backup of Hermes Agent state and memory to Cloudflare R2 storage with Brevo transactional email failure alerting.
 
 ## Table of Contents
@@ -452,6 +454,8 @@ Run the comprehensive unit and integration test suite:
 ```bash
 npm test
 ```
+
+Continuous integration runs automatically via GitHub Actions across Node.js 18.x, 20.x, and 22.x on push and pull requests.
 
 All 120+ tests validate:
 
