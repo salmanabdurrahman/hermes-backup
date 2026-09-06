@@ -51,6 +51,7 @@ export function loadConfig(env = process.env) {
     },
     retentionDays: Number.isInteger(retentionDays) && retentionDays > 0 ? retentionDays : 3,
     tempDir: (env.BACKUP_TEMP_DIR || '').trim() || '/tmp',
+    encryptionKey: (env.BACKUP_ENCRYPTION_KEY || '').trim() || undefined,
   };
 }
 
@@ -118,6 +119,14 @@ export function validateConfig(config, options = {}) {
     if (!config.tempDir) {
       errors.push('BACKUP_TEMP_DIR must be specified');
     }
+
+    if (config.encryptionKey !== undefined) {
+      if (typeof config.encryptionKey !== 'string') {
+        errors.push('BACKUP_ENCRYPTION_KEY must be a string');
+      } else if (config.encryptionKey.trim().length === 0) {
+        errors.push('BACKUP_ENCRYPTION_KEY cannot be empty when specified');
+      }
+    }
   }
 
   if (errors.length > 0 && throwOnError) {
@@ -150,6 +159,9 @@ export function extractSecrets(configOrEnv = {}) {
   };
 
   // If it's a nested config object
+  if (configOrEnv.encryptionKey) {
+    addIfSecret(configOrEnv.encryptionKey);
+  }
   if (configOrEnv.r2) {
     addIfSecret(configOrEnv.r2.accessKeyId);
     addIfSecret(configOrEnv.r2.secretAccessKey);
@@ -170,7 +182,8 @@ export function extractSecrets(configOrEnv = {}) {
         upperKey.includes('PASSWORD') ||
         upperKey.includes('AUTH') ||
         upperKey.includes('API') ||
-        upperKey.includes('ACCOUNT_ID')
+        upperKey.includes('ACCOUNT_ID') ||
+        upperKey.includes('ENCRYPTION')
       ) {
         addIfSecret(value);
       }

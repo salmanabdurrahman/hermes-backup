@@ -74,6 +74,19 @@ export {
 } from './lock.js';
 
 export {
+  ALGORITHM,
+  SALT_LENGTH,
+  IV_LENGTH,
+  TAG_LENGTH,
+  KEY_LENGTH,
+  MIN_ENVELOPE_LENGTH,
+  deriveKey,
+  encryptArchiveFile,
+  decryptArchiveFile,
+  isEncryptionEnabled,
+} from './crypto.js';
+
+export {
   CLI_VERSION,
   COMMANDS,
   HELP_TEXT,
