@@ -125,7 +125,7 @@ Active SQLite databases running in Write-Ahead Logging (WAL) mode hold uncommitt
 Hermes Backup CLI provides comprehensive WAL protection:
 
 1. **Generic Triad Discovery**: Automatically detects when any `.db` file (e.g. `mnemosyne.db`, `kanban.db`, `executions.db`) has an active `-wal` or `-shm` companion file and copies companion files into the staging directory.
-2. **Atomic Online Backup for `state.db`**: For high-write operational databases (`state.db`), Hermes Backup CLI performs an online snapshot via the SQLite `.backup` command. This flushes active WAL transactions into a single, self-contained, crash-consistent database without risking dirty reads, torn writes, or WAL companion mismatches. If `sqlite3` CLI is unavailable, it gracefully falls back to direct file staging.
+2. **Atomic Online Backup for `state.db`**: For high-write operational databases (`state.db`), Hermes Backup CLI performs an online snapshot via the SQLite `.backup` command with `.bail on`. This flushes active WAL transactions into a single, self-contained, crash-consistent database without risking dirty reads, torn writes, or WAL companion mismatches. If the `sqlite3` CLI binary is not installed on the host, it logs a warning and falls back to direct file staging. If the database is corrupt or encounters lock contention or I/O errors, execution halts with a structured error to prevent false-success backups of damaged state.
 
 ## Prerequisites
 

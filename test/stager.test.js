@@ -18,6 +18,7 @@ import {
   resolveBackupPathsSync,
   createStagingDirectory,
   cleanStagingDirectory,
+  stageLiveSqliteDatabase,
   stageBackup,
 } from '../src/stager.js';
 
@@ -758,6 +759,178 @@ describe('Include-First Path Resolver & SQLite WAL Stager', () => {
         { encoding: 'utf8' }
       ).trim();
       assert.ok(queryResult.includes('openai/gpt-5.6-luna|Hello from Telegram'));
+
+      await cleanStagingDirectory(stageResult.stagingDir, testTempDir);
+    });
+  });
+
+  describe('SQLite Live Database Staging & Error Handling', () => {
+    it('should successfully backup live state.db using sqlite3 online backup (.bail on)', async () => {
+      const sourceDb = path.join(mockHermesHome, 'state.db');
+      const destDb = path.join(testTempDir, 'dest_state.db');
+
+      execFileSync('sqlite3', [
+        sourceDb,
+        `
+        PRAGMA journal_mode = WAL;
+        CREATE TABLE settings (key TEXT PRIMARY KEY, val TEXT);
+        INSERT INTO settings VALUES ('theme', 'dark');
+        `,
+      ]);
+
+      await stageLiveSqliteDatabase(sourceDb, destDb);
+      assert.ok(fs.existsSync(destDb));
+
+      const integrity = execFileSync('sqlite3', [destDb, 'PRAGMA integrity_check;'], {
+        encoding: 'utf8',
+      }).trim();
+      assert.equal(integrity, 'ok');
+
+      const selectResult = execFileSync('sqlite3', [destDb, 'SELECT val FROM settings WHERE key="theme";'], {
+        encoding: 'utf8',
+      }).trim();
+      assert.equal(selectResult, 'dark');
+    });
+
+    it('should fallback to copyFile with warning when sqlite3 CLI is missing (ENOENT)', async () => {
+      const sourceDb = path.join(mockHermesHome, 'state.db');
+      const destDb = path.join(testTempDir, 'fallback_dest.db');
+
+      await fs.promises.writeFile(sourceDb, 'mock-sqlite-database-bytes-for-fallback');
+
+      let warningLogged = null;
+      await stageLiveSqliteDatabase(sourceDb, destDb, {
+        sqliteBinary: 'nonexistent-sqlite3-bin-xyz',
+        onWarning: (msg) => {
+          warningLogged = msg;
+        },
+      });
+
+      assert.ok(fs.existsSync(destDb));
+      const content = await fs.promises.readFile(destDb, 'utf8');
+      assert.equal(content, 'mock-sqlite-database-bytes-for-fallback');
+      assert.ok(warningLogged);
+      assert.match(warningLogged, /sqlite3 CLI not found on host/i);
+    });
+
+    it('should rethrow structured error when database is corrupt and NOT fall back to copyFile', async () => {
+      const sourceDb = path.join(mockHermesHome, 'corrupt_state.db');
+      const destDb = path.join(testTempDir, 'corrupt_dest.db');
+
+      // Write corrupted garbage bytes that fail SQLite parsing
+      await fs.promises.writeFile(sourceDb, 'CORRUPT_INVALID_SQLITE_HEADER_CONTENT');
+
+      let warningCalled = false;
+      await assert.rejects(
+        async () => {
+          await stageLiveSqliteDatabase(sourceDb, destDb, {
+            onWarning: () => {
+              warningCalled = true;
+            },
+          });
+        },
+        (err) => {
+          assert.equal(warningCalled, false, 'Should not issue missing-binary warning on corruption');
+          assert.match(err.message, /SQLite online backup failed for/);
+          assert.ok(err.code);
+          assert.notEqual(err.code, 'ENOENT');
+          assert.ok(err.cause);
+          return true;
+        }
+      );
+    });
+
+    it('should rethrow structured error on disk I/O, lock contention, or execution failure', async () => {
+      const sourceDb = path.join(mockHermesHome, 'state.db');
+      const destDb = path.join(testTempDir, 'dest.db');
+
+      await fs.promises.writeFile(sourceDb, 'sample-content');
+
+      const mockExecFileAsync = async () => {
+        const error = new Error('database is locked (SQLITE_BUSY)');
+        error.code = 'SQLITE_BUSY';
+        throw error;
+      };
+
+      await assert.rejects(
+        async () => {
+          await stageLiveSqliteDatabase(sourceDb, destDb, {
+            execFileAsync: mockExecFileAsync,
+          });
+        },
+        (err) => {
+          assert.match(err.message, /database is locked \(SQLITE_BUSY\)/);
+          assert.equal(err.code, 'SQLITE_BUSY');
+          assert.ok(err.cause);
+          return true;
+        }
+      );
+      assert.ok(!fs.existsSync(destDb));
+    });
+
+    it('should rethrow structured error when sqlite3 backup produces empty file from non-empty source', async () => {
+      const sourceDb = path.join(mockHermesHome, 'state.db');
+      const destDb = path.join(testTempDir, 'empty_dest.db');
+
+      await fs.promises.writeFile(sourceDb, 'non-empty-source-data');
+
+      const mockExecFileAsync = async () => {
+        await fs.promises.writeFile(destDb, '');
+      };
+
+      await assert.rejects(
+        async () => {
+          await stageLiveSqliteDatabase(sourceDb, destDb, {
+            execFileAsync: mockExecFileAsync,
+          });
+        },
+        (err) => {
+          assert.match(err.message, /produced an empty file \(0 bytes\) from a non-empty source/);
+          assert.equal(err.code, 'SQLITE_BACKUP_FAILED');
+          return true;
+        }
+      );
+    });
+
+    it('should fail stageBackup and clean up staging directory when state.db backup fails', async () => {
+      const stateDbPath = path.join(mockHermesHome, 'state.db');
+      await fs.promises.writeFile(stateDbPath, 'CORRUPTED_SQLITE_DATABASE_DATA');
+
+      let caughtErr = null;
+      try {
+        await stageBackup(mockHermesHome, { tempDir: testTempDir });
+      } catch (err) {
+        caughtErr = err;
+      }
+
+      assert.ok(caughtErr, 'stageBackup should reject when state.db fails backup');
+      assert.match(caughtErr.message, /SQLite online backup failed for/);
+
+      // Verify no leaked staging directories exist in testTempDir
+      const filesInTemp = await fs.promises.readdir(testTempDir);
+      const stagingDirs = filesInTemp.filter((f) => f.startsWith('hermes-backup-'));
+      assert.equal(stagingDirs.length, 0, 'Staging directory should be cleaned up on failure');
+    });
+
+    it('should fallback to copyFile with warning during stageBackup when sqlite3 binary is missing', async () => {
+      const stateDbPath = path.join(mockHermesHome, 'state.db');
+      await fs.promises.writeFile(stateDbPath, 'mock-state-db-data');
+
+      const warnings = [];
+      const stageResult = await stageBackup(mockHermesHome, {
+        tempDir: testTempDir,
+        sqliteBinary: 'nonexistent-sqlite3-cli-bin',
+        onWarning: (msg) => warnings.push(msg),
+      });
+
+      assert.ok(stageResult.stagingDir);
+      const stagedStateDb = path.join(stageResult.stagingDir, 'state.db');
+      assert.ok(fs.existsSync(stagedStateDb));
+      const content = await fs.promises.readFile(stagedStateDb, 'utf8');
+      assert.equal(content, 'mock-state-db-data');
+
+      assert.equal(warnings.length, 1);
+      assert.match(warnings[0], /sqlite3 CLI not found on host/i);
 
       await cleanStagingDirectory(stageResult.stagingDir, testTempDir);
     });

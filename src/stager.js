@@ -617,25 +617,61 @@ export async function cleanStagingDirectory(stagingDir, tempDir = '/tmp') {
 /**
  * Stages a live SQLite database file using atomic online backup (.backup command)
  * to guarantee transaction consistency and flush active WAL data.
- * Falls back to standard copyFile if sqlite3 CLI is unavailable or errors.
+ * Falls back to standard copyFile strictly when sqlite3 CLI is absent (ENOENT).
+ * Enforces .bail on; throws structured errors for corruption, lock contention, or I/O failure.
  *
  * @param {string} sourcePath - Absolute path to source SQLite database
  * @param {string} destPath - Absolute path to destination backup file
+ * @param {object} [options]
+ * @param {(message: string) => void} [options.onWarning] - Callback invoked when falling back due to missing CLI
+ * @param {string} [options.sqliteBinary='sqlite3'] - SQLite CLI binary name or path
+ * @param {Function} [options.execFileAsync] - Optional child_process execFile runner
  * @returns {Promise<void>}
  */
-export async function stageLiveSqliteDatabase(sourcePath, destPath) {
+export async function stageLiveSqliteDatabase(sourcePath, destPath, options = {}) {
+  const {
+    onWarning,
+    sqliteBinary = 'sqlite3',
+    execFileAsync: execFn = execFileAsync,
+  } = options;
+
+  const escapedDest = destPath.replace(/"/g, '\\"');
+
   try {
-    const escapedDest = destPath.replace(/"/g, '\\"');
-    await execFileAsync('sqlite3', [sourcePath, `.backup "${escapedDest}"`]);
+    // Enforce .bail on so sqlite3 immediately exits with non-zero status on error
+    await execFn(sqliteBinary, [
+      sourcePath,
+      '.bail on',
+      `.backup "${escapedDest}"`,
+    ]);
+
     const stat = await fs.promises.stat(destPath);
     if (stat.size === 0) {
       const srcStat = await fs.promises.stat(sourcePath);
       if (srcStat.size > 0) {
-        throw new Error('sqlite3 .backup produced an empty file from non-empty source');
+        throw new Error(
+          'sqlite3 .backup produced an empty file (0 bytes) from a non-empty source'
+        );
       }
     }
-  } catch {
-    await fs.promises.copyFile(sourcePath, destPath);
+  } catch (err) {
+    if (err.code === 'ENOENT') {
+      if (typeof onWarning === 'function') {
+        onWarning(
+          'sqlite3 CLI not found on host. Falling back to raw file copy. Transactional consistency not guaranteed.'
+        );
+      }
+      await fs.promises.copyFile(sourcePath, destPath);
+      return;
+    }
+
+    // Never swallow database corruption, disk errors, or exclusive lock contention
+    const enhancedError = new Error(
+      `SQLite online backup failed for ${sourcePath}: ${err.message}`
+    );
+    enhancedError.code = err.code || 'SQLITE_BACKUP_FAILED';
+    enhancedError.cause = err;
+    throw enhancedError;
   }
 }
 
@@ -664,6 +700,9 @@ export async function stageBackup(hermesHome, options = {}) {
     tempDir = '/tmp',
     dryRun = false,
     whitelist,
+    onWarning,
+    sqliteBinary,
+    execFileAsync: execFn,
   } = options;
 
   const timestamp = formatBackupTimestamp();
@@ -701,7 +740,11 @@ export async function stageBackup(hermesHome, options = {}) {
       await fs.promises.mkdir(destDir, { recursive: true });
 
       if (path.posix.basename(file.relativePath) === 'state.db') {
-        await stageLiveSqliteDatabase(file.absolutePath, destPath);
+        await stageLiveSqliteDatabase(file.absolutePath, destPath, {
+          onWarning,
+          sqliteBinary,
+          execFileAsync: execFn,
+        });
       } else {
         await fs.promises.copyFile(file.absolutePath, destPath);
       }

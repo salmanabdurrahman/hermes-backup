@@ -253,7 +253,16 @@ describe('End-to-End Integration Test Suite & Mock VPS Validation', () => {
     await fs.promises.writeFile(path.join(targetHome, 'context_length_cache.yaml'), 'claude: 200000\n');
     await fs.promises.writeFile(path.join(targetHome, 'channel_directory.json'), '{"channels":[]}');
     await fs.promises.writeFile(path.join(targetHome, '.skills_prompt_snapshot.json'), '{"skills":[]}');
-    await fs.promises.writeFile(path.join(targetHome, 'state.db'), 'state-db-data');
+
+    const stateDbPath = path.join(targetHome, 'state.db');
+    execFileSync('sqlite3', [
+      stateDbPath,
+      `
+      PRAGMA journal_mode = WAL;
+      CREATE TABLE active_sessions (id INTEGER PRIMARY KEY, session_token TEXT);
+      INSERT INTO active_sessions (session_token) VALUES ('sess_xyz_active');
+      `,
+    ]);
 
     // --- Safety-Net Excluded Files (Must NOT be included in backup) ---
     // State db companions (excluded; atomic backup handles state.db)
