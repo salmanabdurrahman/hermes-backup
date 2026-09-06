@@ -177,6 +177,19 @@ describe('CLI Dispatcher & Command Routing', () => {
       assert.equal(parsed.options.latest, false);
     });
 
+    it('should parse --local-test flag', () => {
+      const parsed = parseCliArgs(['backup', '--local-test']);
+      assert.equal(parsed.command, 'backup');
+      assert.equal(parsed.options.localTest, true);
+      assert.equal(parsed.options.dryRun, false);
+    });
+
+    it('should parse both --dry-run and --local-test flags independently', () => {
+      const parsedBoth = parseCliArgs(['backup', '--dry-run', '--local-test']);
+      assert.equal(parsedBoth.options.dryRun, true);
+      assert.equal(parsedBoth.options.localTest, true);
+    });
+
     it('should parse restore and verify subcommands with --latest and --dry-run', () => {
       const parsedRestore = parseCliArgs(['restore', '--latest', '--dry-run']);
       assert.equal(parsedRestore.command, 'restore');
@@ -220,15 +233,152 @@ describe('CLI Dispatcher & Command Routing', () => {
       assert.equal(result.success, true);
       assert.equal(result.exitCode, 0);
       assert.ok(result.summary.dryRun);
+      assert.equal(result.summary.localTest, false);
       assert.ok(result.summary.fileCount >= 6);
 
       const logOutput = io.getLogs();
       assert.ok(logOutput.includes('[INFO] Starting Hermes backup...'));
       assert.ok(logOutput.includes('Discovered'));
-      assert.ok(logOutput.includes('Staged SQLite databases with WAL companion files'));
+      assert.ok(logOutput.includes('[DRY-RUN] Planning mode: path discovery and size calculation complete'));
       assert.ok(logOutput.includes('[DRY-RUN] Archive simulated:'));
       assert.ok(logOutput.includes('[DRY-RUN] Upload skipped (dry-run mode)'));
       assert.ok(logOutput.includes('Cleaned temporary files. Backup completed successfully.'));
+
+      // Confirm --dry-run creates NO staging directories or archive files on disk
+      const tempEntries = await fs.promises.readdir(tempTestDir);
+      const stagingOrArchives = tempEntries.filter(
+        (e) => e.startsWith('hermes-backup-') || e.endsWith('.tar.gz')
+      );
+      assert.equal(stagingOrArchives.length, 0);
+    });
+
+    it('should execute backup with --local-test simulating staging, archive creation, tar verification, and local decryption without remote mutations', async () => {
+      const io = createMockIo();
+      const config = {
+        ...validTestConfig,
+        hermesHome: mockHermesHome,
+        tempDir: tempTestDir,
+      };
+
+      let putCommandSent = false;
+      const mockS3Client = {
+        send: async (command) => {
+          if (command instanceof PutObjectCommand) {
+            putCommandSent = true;
+          }
+          return {};
+        },
+      };
+
+      let alertSent = false;
+      const mockFetch = async () => {
+        alertSent = true;
+        return { ok: true };
+      };
+
+      const result = await backupCommand(
+        { localTest: true, verbose: true },
+        { config, io, s3Client: mockS3Client, fetch: mockFetch }
+      );
+
+      assert.equal(result.success, true);
+      assert.equal(result.exitCode, 0);
+      assert.equal(result.summary.dryRun, false);
+      assert.equal(result.summary.localTest, true);
+      assert.ok(result.summary.fileCount >= 6);
+      assert.ok(result.summary.archiveSize > 0);
+      assert.equal(putCommandSent, false);
+      assert.equal(alertSent, false);
+
+      const logs = io.getLogs();
+      assert.ok(logs.includes('[INFO] Starting Hermes backup...'));
+      assert.ok(logs.includes('Staged SQLite databases with WAL companion files'));
+      assert.ok(logs.includes('Verified SQLite structural integrity across staged databases'));
+      assert.ok(logs.includes('Compressed archive created:'));
+      assert.ok(logs.includes('Archive integrity verified'));
+      assert.ok(logs.includes('[LOCAL-TEST] Testing client-side encryption and decryption roundtrip...'));
+      assert.ok(logs.includes('[LOCAL-TEST] Local decryption testing verified successfully'));
+      assert.ok(logs.includes('[LOCAL-TEST] Upload skipped (local-test mode)'));
+      assert.ok(logs.includes('[LOCAL-TEST] Remote retention pruning skipped (local-test mode)'));
+      assert.ok(logs.includes('Cleaned temporary files. Backup completed successfully.'));
+
+      // Verify all temporary simulation resources were cleaned up
+      const tempEntries = await fs.promises.readdir(tempTestDir);
+      const remainingBackups = tempEntries.filter(
+        (e) => e.startsWith('hermes-backup-') || e.startsWith('local-test-') || e.endsWith('.tar.gz')
+      );
+      assert.equal(remainingBackups.length, 0);
+    });
+
+    it('should execute --local-test with configured BACKUP_ENCRYPTION_KEY', async () => {
+      const io = createMockIo();
+      const config = {
+        ...validTestConfig,
+        hermesHome: mockHermesHome,
+        tempDir: tempTestDir,
+        encryptionKey: 'test-custom-passphrase-888',
+      };
+
+      const result = await backupCommand(
+        { localTest: true, verbose: true },
+        { config, io }
+      );
+
+      assert.equal(result.success, true);
+      assert.equal(result.exitCode, 0);
+      assert.equal(result.summary.localTest, true);
+
+      const logs = io.getLogs();
+      assert.ok(logs.includes('configured encryption key'));
+      assert.ok(logs.includes('Local decryption testing verified successfully'));
+    });
+
+    it('should fail --local-test and omit Brevo failure alert when staged SQLite database is corrupt', async () => {
+      const io = createMockIo();
+      const config = {
+        ...validTestConfig,
+        hermesHome: mockHermesHome,
+        tempDir: tempTestDir,
+      };
+
+      // Corrupt database in mock Hermes home
+      const mnemosyneDir = path.join(mockHermesHome, 'mnemosyne', 'data');
+      await fs.promises.writeFile(path.join(mnemosyneDir, 'mnemosyne.db'), 'CORRUPTED_DB_CONTENT');
+
+      let alertSent = false;
+      const mockFetch = async () => {
+        alertSent = true;
+        return { ok: true };
+      };
+
+      const result = await backupCommand(
+        { localTest: true, verbose: true },
+        { config, io, fetch: mockFetch }
+      );
+
+      assert.equal(result.success, false);
+      assert.equal(result.exitCode, 1);
+      assert.ok(result.error);
+      assert.match(result.error.message, /SQLite integrity check failed for staged database/);
+      assert.equal(alertSent, false); // Zero remote mutations: Brevo omitted
+
+      const errors = io.getErrors();
+      assert.ok(errors.includes('[ERROR] Backup failed:'));
+    });
+
+    it('should abort and fail when both --dry-run and --local-test are specified in backupCommand', async () => {
+      const io = createMockIo();
+      const config = {
+        ...validTestConfig,
+        hermesHome: mockHermesHome,
+        tempDir: tempTestDir,
+      };
+
+      const result = await backupCommand({ dryRun: true, localTest: true }, { config, io });
+      assert.equal(result.success, false);
+      assert.equal(result.exitCode, 1);
+      assert.match(result.error.message, /Cannot specify both --dry-run and --local-test simultaneously/);
+      assert.ok(io.getErrors().includes('Cannot specify both --dry-run and --local-test simultaneously.'));
     });
 
     it('should execute full backup workflow with mock S3Client and prune expired backups', async () => {
@@ -1075,6 +1225,66 @@ describe('CLI Dispatcher & Command Routing', () => {
       assert.equal(getObjectKeyRequested, 'backups/hermes-backup-2026-08-29_200000.tar.gz');
       assert.ok(fs.existsSync(path.join(targetRecoveryDir, 'latest-file.txt')));
     });
+
+    it('should execute restore with --local-test without modifying destination directory', async () => {
+      const io = createMockIo();
+      const config = {
+        ...validTestConfig,
+        hermesHome: mockHermesHome,
+        tempDir: tempTestDir,
+      };
+
+      const sampleStagingDir = path.join(tempTestDir, 'restore-local-test-stage');
+      await fs.promises.mkdir(sampleStagingDir, { recursive: true });
+      await fs.promises.writeFile(path.join(sampleStagingDir, 'recovered-file.txt'), 'recovered-data\n');
+
+      const archiveResult = await createArchive(sampleStagingDir, { outputDir: tempTestDir });
+      const archiveBuffer = await fs.promises.readFile(archiveResult.archivePath);
+      const targetRecoveryDir = path.join(tempTestDir, 'simulated-target-dir');
+
+      const mockS3Client = {
+        send: async (command) => {
+          if (command instanceof GetObjectCommand) {
+            return {
+              Body: archiveBuffer,
+              Metadata: { sha256: archiveResult.sha256 },
+              LastModified: new Date('2026-08-29T12:00:00Z'),
+            };
+          }
+        },
+      };
+
+      const result = await restoreCommand(
+        {
+          archiveName: 'hermes-backup-2026-08-29_120000.tar.gz',
+          targetDir: targetRecoveryDir,
+          localTest: true,
+        },
+        { config, io, s3Client: mockS3Client }
+      );
+
+      assert.equal(result.success, true);
+      assert.equal(result.exitCode, 0);
+      assert.equal(result.summary.localTest, true);
+      assert.equal(result.summary.dryRun, false);
+      assert.ok(io.getLogs().includes('[LOCAL-TEST] Recovery simulation: verified archive structure'));
+      // Ensure target directory was NOT modified or created with files
+      assert.equal(fs.existsSync(path.join(targetRecoveryDir, 'recovered-file.txt')), false);
+    });
+
+    it('should reject restore when both --dry-run and --local-test are specified', async () => {
+      const io = createMockIo();
+      const config = {
+        ...validTestConfig,
+        hermesHome: mockHermesHome,
+        tempDir: tempTestDir,
+      };
+
+      const result = await restoreCommand({ dryRun: true, localTest: true }, { config, io });
+      assert.equal(result.success, false);
+      assert.equal(result.exitCode, 1);
+      assert.match(result.error.message, /Cannot specify both --dry-run and --local-test simultaneously/);
+    });
   });
 
   describe('verifyCommand execution', () => {
@@ -1144,6 +1354,20 @@ describe('CLI Dispatcher & Command Routing', () => {
       // Ensure mockHermesHome was untouched
       const filesAfter = await fs.promises.readdir(mockHermesHome);
       assert.deepEqual(filesBefore, filesAfter);
+    });
+
+    it('should reject verify when both --dry-run and --local-test are specified', async () => {
+      const io = createMockIo();
+      const config = {
+        ...validTestConfig,
+        hermesHome: mockHermesHome,
+        tempDir: tempTestDir,
+      };
+
+      const result = await verifyCommand({ dryRun: true, localTest: true }, { config, io });
+      assert.equal(result.success, false);
+      assert.equal(result.exitCode, 1);
+      assert.match(result.error.message, /Cannot specify both --dry-run and --local-test simultaneously/);
     });
 
     it('should fail verification if SQLite integrity check fails', async () => {
@@ -1258,6 +1482,27 @@ describe('CLI Dispatcher & Command Routing', () => {
       assert.ok(io.getLogs().includes('[INFO] Starting Hermes archive verification...'));
       assert.ok(io.getLogs().includes('[DRY-RUN] Simulating verification without downloading'));
     });
+
+    it('should return exit code 1 when both --dry-run and --local-test are specified', async () => {
+      const io = createMockIo();
+      const exit = await runCli(['backup', '--dry-run', '--local-test'], { io });
+      assert.equal(exit, 1);
+      assert.ok(io.getErrors().includes('Cannot specify both --dry-run and --local-test simultaneously.'));
+    });
+
+    it('should route to backupCommand with --local-test', async () => {
+      const io = createMockIo();
+      const config = {
+        ...validTestConfig,
+        hermesHome: mockHermesHome,
+        tempDir: tempTestDir,
+      };
+
+      const exit = await runCli(['backup', '--local-test', '--verbose'], { config, io });
+      assert.equal(exit, 0);
+      assert.ok(io.getLogs().includes('[INFO] Starting Hermes backup...'));
+      assert.ok(io.getLogs().includes('[LOCAL-TEST] Upload skipped (local-test mode)'));
+    });
   });
 
   describe('Index Module Re-exports', () => {
@@ -1314,6 +1559,40 @@ describe('CLI Dispatcher & Command Routing', () => {
         (err) => {
           assert.equal(err.code, 1);
           assert.ok(err.stderr.includes('Unknown command'));
+          return true;
+        }
+      );
+    });
+
+    it('should execute node cli.js backup --local-test via child process and exit with code 0', async () => {
+      const cliPath = path.resolve('./cli.js');
+      const { stdout } = await execFileAsync(process.execPath, [cliPath, 'backup', '--local-test'], {
+        env: {
+          ...process.env,
+          HERMES_HOME: mockHermesHome,
+          BACKUP_TEMP_DIR: tempTestDir,
+        },
+      });
+      assert.ok(stdout.includes('Starting Hermes backup...'));
+      assert.ok(stdout.includes('[LOCAL-TEST] Upload skipped (local-test mode)'));
+      assert.ok(stdout.includes('Backup completed successfully.'));
+    });
+
+    it('should execute node cli.js backup --dry-run --local-test via child process and exit with code 1', async () => {
+      const cliPath = path.resolve('./cli.js');
+      await assert.rejects(
+        async () => {
+          await execFileAsync(process.execPath, [cliPath, 'backup', '--dry-run', '--local-test'], {
+            env: {
+              ...process.env,
+              HERMES_HOME: mockHermesHome,
+              BACKUP_TEMP_DIR: tempTestDir,
+            },
+          });
+        },
+        (err) => {
+          assert.equal(err.code, 1);
+          assert.ok(err.stderr.includes('Cannot specify both --dry-run and --local-test simultaneously.'));
           return true;
         }
       );

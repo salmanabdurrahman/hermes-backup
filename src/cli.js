@@ -32,6 +32,7 @@ import {
   formatBytes,
 } from './storage.js';
 import {
+  encryptArchiveFile,
   decryptArchiveFile,
   isEncryptionEnabled,
 } from './crypto.js';
@@ -80,7 +81,8 @@ Options:
   --target-dir <path>  Destination recovery directory (default: HERMES_HOME)
   --latest             Select the most recent backup archive from R2
   --force              Overwrite existing destination files without confirmation
-  --dry-run            Simulate operations without making remote network mutations
+  --dry-run            Planning mode: inspect paths and calculate sizes without disk or network operations
+  --local-test         Full execution simulation: stage, archive, verify tar, test decryption without remote mutations
   -v, --verbose        Enable detailed step-by-step progress logging
   -h, --help           Display help information
   -V, --version        Display version number
@@ -88,7 +90,9 @@ Options:
 
 Examples:
   node cli.js backup
-  node cli.js backup --dry-run --verbose
+  node cli.js backup --dry-run
+  node cli.js backup --local-test
+  node cli.js backup --local-test --verbose
   node cli.js test-notify
   node cli.js list
   node cli.js restore --latest
@@ -120,6 +124,7 @@ Examples:
 export function parseCliArgs(rawArgs = process.argv.slice(2)) {
   const optionsConfig = {
     'dry-run': { type: 'boolean', default: false },
+    'local-test': { type: 'boolean', default: false },
     verbose: { type: 'boolean', short: 'v', default: false },
     help: { type: 'boolean', short: 'h', default: false },
     version: { type: 'boolean', short: 'V', default: false },
@@ -147,6 +152,7 @@ export function parseCliArgs(rawArgs = process.argv.slice(2)) {
     archiveName,
     options: {
       dryRun: Boolean(values['dry-run']),
+      localTest: Boolean(values['local-test']),
       verbose: Boolean(values.verbose),
       help: Boolean(values.help),
       version: Boolean(values.version),
@@ -192,7 +198,7 @@ export function printVersion(io = console) {
  * @returns {Promise<{ success: boolean, exitCode: number, error?: Error, summary?: object }>}
  */
 export async function backupCommand(options = {}, context = {}) {
-  const { dryRun = false, verbose = false } = options;
+  const { dryRun = false, localTest = false, verbose = false } = options;
   const {
     env = process.env,
     config: customConfig,
@@ -216,6 +222,17 @@ export async function backupCommand(options = {}, context = {}) {
   };
   const logError = (msg) => io.error(msg);
 
+  if (dryRun && localTest) {
+    const error = new Error('Cannot specify both --dry-run and --local-test simultaneously.');
+    error.code = 'ERR_EXCLUSIVE_OPTIONS';
+    logError(`[ERROR] ${error.message}`);
+    return {
+      success: false,
+      exitCode: 1,
+      error,
+    };
+  }
+
   let stagingDir = null;
   let archivePath = null;
   let lockAcquired = false;
@@ -231,8 +248,8 @@ export async function backupCommand(options = {}, context = {}) {
 
     // Validate configuration
     validateConfig(config, {
-      requireR2: !dryRun,
-      requireBrevo: !dryRun,
+      requireR2: !dryRun && !localTest,
+      requireBrevo: !dryRun && !localTest,
       throwOnError: true,
     });
 
@@ -273,8 +290,10 @@ export async function backupCommand(options = {}, context = {}) {
     logVerbose(
       `[INFO] Verified temporary storage capacity on ${config.tempDir} (minimum ${formatBytes(stageResult.totalBytes * 2)} required)`
     );
-    log('[INFO] Staged SQLite databases with WAL companion files');
-    if (!dryRun) {
+    if (dryRun) {
+      log('[INFO] [DRY-RUN] Planning mode: path discovery and size calculation complete (no staging files created)');
+    } else {
+      log('[INFO] Staged SQLite databases with WAL companion files');
       logVerbose('[INFO] Verified SQLite structural integrity across staged databases');
     }
 
@@ -303,6 +322,45 @@ export async function backupCommand(options = {}, context = {}) {
       // Verify archive integrity
       await validateArchive(archivePath);
       logVerbose(`[INFO] Archive integrity verified (${archiveResult.entryCount} entries)`);
+
+      // Local decryption testing in simulation mode
+      if (localTest) {
+        let testKey = config.encryptionKey;
+        let usingEphemeralKey = false;
+        if (!isEncryptionEnabled(config)) {
+          testKey = crypto.randomBytes(32).toString('hex');
+          usingEphemeralKey = true;
+        }
+
+        const testEncryptedPath = path.join(
+          config.tempDir,
+          `local-test-${Date.now()}-${crypto.randomBytes(4).toString('hex')}.enc`
+        );
+        const testDecryptedPath = path.join(
+          config.tempDir,
+          `local-test-${Date.now()}-${crypto.randomBytes(4).toString('hex')}.tar.gz`
+        );
+
+        try {
+          log('[INFO] [LOCAL-TEST] Testing client-side encryption and decryption roundtrip...');
+          await encryptArchiveFile(archivePath, testEncryptedPath, testKey);
+          logVerbose(
+            `[INFO] [LOCAL-TEST] Encrypted simulation archive: ${formatBytes((await fs.promises.stat(testEncryptedPath)).size)}`
+          );
+
+          await decryptArchiveFile(testEncryptedPath, testDecryptedPath, testKey);
+          logVerbose('[INFO] [LOCAL-TEST] Decrypted simulation archive successfully');
+
+          // Verify decrypted archive structure
+          const decryptedValidation = await validateArchive(testDecryptedPath);
+          log(
+            `[INFO] [LOCAL-TEST] Local decryption testing verified successfully (${decryptedValidation.entries.length} entries intact${usingEphemeralKey ? ', ephemeral simulation key' : ', configured encryption key'})`
+          );
+        } finally {
+          await fs.promises.unlink(testEncryptedPath).catch(() => {});
+          await fs.promises.unlink(testDecryptedPath).catch(() => {});
+        }
+      }
     }
 
     // 3. Remote Upload Step
@@ -315,6 +373,17 @@ export async function backupCommand(options = {}, context = {}) {
         size: stageResult.totalBytes,
         etag: '"dry-run-etag"',
         dryRun: true,
+        localTest: false,
+      };
+    } else if (localTest) {
+      log('[INFO] [LOCAL-TEST] Upload skipped (local-test mode)');
+      uploadResult = {
+        key: `backups/${path.posix.basename(archivePath)}`,
+        bucket: config.r2.bucketName,
+        size: archiveResult.size,
+        etag: '"local-test-etag"',
+        dryRun: false,
+        localTest: true,
       };
     } else {
       const uploadStart = Date.now();
@@ -346,8 +415,18 @@ export async function backupCommand(options = {}, context = {}) {
           prunedCount: 0,
           totalFreedBytes: 0,
           dryRun: true,
+          localTest: false,
         };
       }
+    } else if (localTest) {
+      log('[INFO] [LOCAL-TEST] Remote retention pruning skipped (local-test mode)');
+      pruneResult = {
+        pruned: [],
+        prunedCount: 0,
+        totalFreedBytes: 0,
+        dryRun: false,
+        localTest: true,
+      };
     } else {
       pruneResult = await pruneExpiredBackups(config, {
         client: s3Client,
@@ -390,6 +469,7 @@ export async function backupCommand(options = {}, context = {}) {
         uploadKey: uploadResult.key,
         prunedCount: pruneResult.prunedCount,
         dryRun,
+        localTest,
       },
     };
   } catch (rawError) {
@@ -411,8 +491,8 @@ export async function backupCommand(options = {}, context = {}) {
       // Suppress secondary cleanup errors
     }
 
-    // Dispatch failure alert via Brevo unless in dry-run mode
-    if (!dryRun) {
+    // Dispatch failure alert via Brevo unless in dry-run or local-test mode
+    if (!dryRun && !localTest) {
       const brevoConfigCheck = validateConfig(config, {
         requireR2: false,
         requireBrevo: true,
@@ -442,6 +522,8 @@ export async function backupCommand(options = {}, context = {}) {
       } else {
         logVerbose('[INFO] Brevo alerting skipped: credentials not configured or incomplete');
       }
+    } else if (localTest) {
+      logVerbose('[INFO] [LOCAL-TEST] Brevo alerting skipped (local-test mode)');
     }
 
     return {
@@ -475,7 +557,7 @@ export async function backupCommand(options = {}, context = {}) {
  * @returns {Promise<{ success: boolean, exitCode: number, error?: Error }>}
  */
 export async function testNotifyCommand(options = {}, context = {}) {
-  const { dryRun = false, verbose = false } = options;
+  const { dryRun = false, localTest = false, verbose = false } = options;
   const {
     env = process.env,
     config: customConfig,
@@ -489,14 +571,33 @@ export async function testNotifyCommand(options = {}, context = {}) {
   const log = (msg) => io.log(msg);
   const logError = (msg) => io.error(msg);
 
+  if (dryRun && localTest) {
+    const error = new Error('Cannot specify both --dry-run and --local-test simultaneously.');
+    error.code = 'ERR_EXCLUSIVE_OPTIONS';
+    logError(`[ERROR] ${error.message}`);
+    return {
+      success: false,
+      exitCode: 1,
+      error,
+    };
+  }
+
   try {
     validateConfig(config, {
       requireR2: false,
-      requireBrevo: !dryRun,
+      requireBrevo: !dryRun && !localTest,
       throwOnError: true,
     });
 
     log('[INFO] Sending test notification email via Brevo...');
+
+    if (localTest) {
+      log('[INFO] [LOCAL-TEST] Test notification simulated successfully (remote email dispatch omitted)');
+      return {
+        success: true,
+        exitCode: 0,
+      };
+    }
 
     const result = await sendTestNotification(config, {
       fetch: customFetch,
@@ -547,7 +648,7 @@ export async function testNotifyCommand(options = {}, context = {}) {
  * @returns {Promise<{ success: boolean, exitCode: number, error?: Error, backups?: any[] }>}
  */
 export async function listCommand(options = {}, context = {}) {
-  const { prefix = 'backups/', verbose = false } = options;
+  const { prefix = 'backups/', dryRun = false, localTest = false, verbose = false } = options;
   const {
     env = process.env,
     config: customConfig,
@@ -560,6 +661,17 @@ export async function listCommand(options = {}, context = {}) {
 
   const log = (msg) => io.log(msg);
   const logError = (msg) => io.error(msg);
+
+  if (dryRun && localTest) {
+    const error = new Error('Cannot specify both --dry-run and --local-test simultaneously.');
+    error.code = 'ERR_EXCLUSIVE_OPTIONS';
+    logError(`[ERROR] ${error.message}`);
+    return {
+      success: false,
+      exitCode: 1,
+      error,
+    };
+  }
 
   try {
     validateConfig(config, {
@@ -679,6 +791,7 @@ export async function restoreCommand(options = {}, context = {}) {
     latest = false,
     targetDir: customTargetDir,
     dryRun = false,
+    localTest = false,
     force = false,
     verbose = false,
     prefix = 'backups/',
@@ -703,6 +816,17 @@ export async function restoreCommand(options = {}, context = {}) {
   };
   const logError = (msg) => io.error(msg);
 
+  if (dryRun && localTest) {
+    const error = new Error('Cannot specify both --dry-run and --local-test simultaneously.');
+    error.code = 'ERR_EXCLUSIVE_OPTIONS';
+    logError(`[ERROR] ${error.message}`);
+    return {
+      success: false,
+      exitCode: 1,
+      error,
+    };
+  }
+
   const targetDir = customTargetDir
     ? path.resolve(customTargetDir)
     : path.resolve(config.hermesHome);
@@ -716,7 +840,7 @@ export async function restoreCommand(options = {}, context = {}) {
   try {
     // Validate configuration
     validateConfig(config, {
-      requireR2: !dryRun,
+      requireR2: !dryRun && !localTest,
       requireBrevo: false,
       throwOnError: true,
     });
@@ -763,6 +887,7 @@ export async function restoreCommand(options = {}, context = {}) {
           key: targetKey,
           targetDir,
           dryRun: true,
+          localTest: false,
         },
       };
     }
@@ -851,6 +976,29 @@ export async function restoreCommand(options = {}, context = {}) {
       );
     }
 
+    // If local execution simulation, skip modifying destination directory
+    if (localTest) {
+      log(
+        `[INFO] [LOCAL-TEST] Recovery simulation: verified archive structure and SQLite database integrity without modifying destination: ${targetDir}`
+      );
+      await fs.promises.rm(recoveryDir, { recursive: true, force: true });
+      recoveryDir = null;
+
+      return {
+        success: true,
+        exitCode: 0,
+        summary: {
+          key: targetKey,
+          targetDir,
+          restoredCount: 0,
+          simulatedCount: stagedFiles.length,
+          safetySnapshot: null,
+          dryRun: false,
+          localTest: true,
+        },
+      };
+    }
+
     // 6. Pre-restore Safety Snapshot
     let safetySnapshot = null;
     if (fs.existsSync(targetDir)) {
@@ -922,6 +1070,7 @@ export async function restoreCommand(options = {}, context = {}) {
         restoredCount,
         safetySnapshot: safetySnapshot?.snapshotPath || null,
         dryRun: false,
+        localTest: false,
       },
     };
   } catch (rawError) {
@@ -980,6 +1129,7 @@ export async function verifyCommand(options = {}, context = {}) {
     archiveName: rawArchiveName,
     latest = false,
     dryRun = false,
+    localTest = false,
     verbose = false,
     prefix = 'backups/',
   } = options;
@@ -1001,12 +1151,23 @@ export async function verifyCommand(options = {}, context = {}) {
   };
   const logError = (msg) => io.error(msg);
 
+  if (dryRun && localTest) {
+    const error = new Error('Cannot specify both --dry-run and --local-test simultaneously.');
+    error.code = 'ERR_EXCLUSIVE_OPTIONS';
+    logError(`[ERROR] ${error.message}`);
+    return {
+      success: false,
+      exitCode: 1,
+      error,
+    };
+  }
+
   let recoveryDir = null;
 
   try {
     // Validate configuration
     validateConfig(config, {
-      requireR2: !dryRun,
+      requireR2: !dryRun && !localTest,
       requireBrevo: false,
       throwOnError: true,
     });
@@ -1051,6 +1212,7 @@ export async function verifyCommand(options = {}, context = {}) {
         summary: {
           key: targetKey,
           dryRun: true,
+          localTest: false,
         },
       };
     }
@@ -1149,6 +1311,8 @@ export async function verifyCommand(options = {}, context = {}) {
         fileCount: validationResult.entries.length,
         dbCount: dbFiles.length,
         valid: true,
+        dryRun: false,
+        localTest,
       },
     };
   } catch (rawError) {
@@ -1204,6 +1368,11 @@ export async function runCli(rawArgs = process.argv.slice(2), context = {}) {
   if (options.version) {
     printVersion(io);
     return 0;
+  }
+
+  if (options.dryRun && options.localTest) {
+    io.error('[ERROR] Cannot specify both --dry-run and --local-test simultaneously.');
+    return 1;
   }
 
   if (!command) {

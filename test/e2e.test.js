@@ -722,6 +722,71 @@ describe('End-to-End Integration Test Suite & Mock VPS Validation', () => {
     });
   });
 
+  describe('Local-Test Mode End-to-End Simulation', () => {
+    it('should simulate full execution (staging, archiving, tar verification, and local decryption) with zero remote mutations', async () => {
+      const io = createMockIo();
+      const config = createTestConfig();
+
+      let putObjectCalled = false;
+      let deleteObjectsCalled = false;
+      const mockS3Client = {
+        send: async (command) => {
+          if (command instanceof PutObjectCommand) {
+            putObjectCalled = true;
+          }
+          if (command instanceof DeleteObjectsCommand) {
+            deleteObjectsCalled = true;
+          }
+          return {};
+        },
+      };
+
+      let fetchInvoked = false;
+      const mockFetch = async () => {
+        fetchInvoked = true;
+        return { ok: true };
+      };
+
+      const result = await backupCommand(
+        { localTest: true, verbose: true },
+        {
+          config,
+          io,
+          s3Client: mockS3Client,
+          fetch: mockFetch,
+        }
+      );
+
+      assert.equal(result.success, true);
+      assert.equal(result.exitCode, 0);
+      assert.equal(result.summary.dryRun, false);
+      assert.equal(result.summary.localTest, true);
+      assert.ok(result.summary.fileCount >= 20);
+      assert.equal(putObjectCalled, false);
+      assert.equal(deleteObjectsCalled, false);
+      assert.equal(fetchInvoked, false);
+
+      const logs = io.getLogs();
+      assert.ok(logs.includes('[INFO] Starting Hermes backup...'));
+      assert.ok(logs.includes('Staged SQLite databases with WAL companion files'));
+      assert.ok(logs.includes('Verified SQLite structural integrity across staged databases'));
+      assert.ok(logs.includes('Compressed archive created:'));
+      assert.ok(logs.includes('Archive integrity verified'));
+      assert.ok(logs.includes('[LOCAL-TEST] Testing client-side encryption and decryption roundtrip...'));
+      assert.ok(logs.includes('[LOCAL-TEST] Local decryption testing verified successfully'));
+      assert.ok(logs.includes('[LOCAL-TEST] Upload skipped (local-test mode)'));
+      assert.ok(logs.includes('[LOCAL-TEST] Remote retention pruning skipped (local-test mode)'));
+      assert.ok(logs.includes('Cleaned temporary files. Backup completed successfully.'));
+
+      // Confirm all temporary resources (staging and test archives) were cleaned up
+      const remainingTempEntries = await fs.promises.readdir(mockTempDir);
+      assert.deepEqual(
+        remainingTempEntries.filter((name) => name.startsWith('hermes-backup-') || name.startsWith('local-test-')),
+        []
+      );
+    });
+  });
+
   describe('Subcommands End-to-End: test-notify and list', () => {
     it('should execute test-notify command and dispatch test email via Brevo REST API', async () => {
       const io = createMockIo();
@@ -820,6 +885,27 @@ describe('End-to-End Integration Test Suite & Mock VPS Validation', () => {
       assert.ok(stdout.includes('[INFO] Starting Hermes backup...'));
       assert.ok(stdout.includes('[DRY-RUN] Archive simulated:'));
       assert.ok(stdout.includes('[DRY-RUN] Upload skipped (dry-run mode)'));
+      assert.ok(stdout.includes('Cleaned temporary files. Backup completed successfully.'));
+    });
+
+    it('should execute node cli.js backup --local-test via child process and exit code 0', async () => {
+      const cliPath = path.resolve('./cli.js');
+      const customEnv = {
+        ...process.env,
+        HERMES_HOME: mockHermesHome,
+        BACKUP_TEMP_DIR: mockTempDir,
+      };
+
+      const { stdout } = await execFileAsync(
+        process.execPath,
+        [cliPath, 'backup', '--local-test', '--verbose'],
+        { env: customEnv }
+      );
+
+      assert.ok(stdout.includes('[INFO] Starting Hermes backup...'));
+      assert.ok(stdout.includes('[LOCAL-TEST] Testing client-side encryption and decryption roundtrip...'));
+      assert.ok(stdout.includes('[LOCAL-TEST] Local decryption testing verified successfully'));
+      assert.ok(stdout.includes('[LOCAL-TEST] Upload skipped (local-test mode)'));
       assert.ok(stdout.includes('Cleaned temporary files. Backup completed successfully.'));
     });
 
