@@ -448,6 +448,108 @@ describe('CLI Dispatcher & Command Routing', () => {
       // Clean up test lock file
       await fs.promises.unlink(lockFilePath);
     });
+
+    it('should abort backup, release process lock, and dispatch Brevo alert when temporary storage has insufficient capacity', async () => {
+      const io = createMockIo();
+      const config = {
+        ...validTestConfig,
+        hermesHome: mockHermesHome,
+        tempDir: tempTestDir,
+      };
+
+      const lockFilePath = path.join(tempTestDir, DEFAULT_LOCK_FILENAME);
+      let capturedAlertPayload = null;
+      const mockFetch = async (url, options) => {
+        capturedAlertPayload = JSON.parse(options.body);
+        return {
+          ok: true,
+          status: 201,
+          json: async () => ({ messageId: '<capacity-alert-id-123>' }),
+        };
+      };
+
+      const result = await backupCommand(
+        { dryRun: false, verbose: true },
+        {
+          config,
+          io,
+          fetch: mockFetch,
+          getAvailableDiskSpace: async () => 10, // Mock 10 bytes available (insufficient)
+        }
+      );
+
+      assert.equal(result.success, false);
+      assert.equal(result.exitCode, 1);
+      assert.ok(result.error);
+      assert.equal(result.error.code, 'INSUFFICIENT_STORAGE_CAPACITY');
+      assert.match(result.error.message, /Insufficient temporary storage capacity/i);
+
+      // Verify lock released
+      assert.equal(fs.existsSync(lockFilePath), false);
+
+      // Verify error logged
+      const errors = io.getErrors();
+      assert.ok(errors.includes('[ERROR] Backup failed: Insufficient temporary storage capacity'));
+
+      // Verify Brevo alert sent
+      assert.ok(capturedAlertPayload);
+      assert.ok(capturedAlertPayload.subject.includes('[ALERT] Hermes Backup Failed'));
+      assert.ok(capturedAlertPayload.htmlContent.includes('Insufficient temporary storage capacity'));
+
+      // Verify no lingering staging directory
+      const entries = await fs.promises.readdir(tempTestDir);
+      const stagingDirs = entries.filter((e) => e.startsWith('hermes-backup-'));
+      assert.equal(stagingDirs.length, 0);
+    });
+
+    it('should abort dry-run backup when temporary storage capacity is insufficient without dispatching Brevo alert', async () => {
+      const io = createMockIo();
+      const config = {
+        ...validTestConfig,
+        hermesHome: mockHermesHome,
+        tempDir: tempTestDir,
+      };
+
+      const lockFilePath = path.join(tempTestDir, DEFAULT_LOCK_FILENAME);
+      let alertDispatched = false;
+      const mockFetch = async () => {
+        alertDispatched = true;
+        return { ok: true };
+      };
+
+      const result = await backupCommand(
+        { dryRun: true, verbose: false },
+        {
+          config,
+          io,
+          fetch: mockFetch,
+          getAvailableDiskSpace: async () => 10,
+        }
+      );
+
+      assert.equal(result.success, false);
+      assert.equal(result.exitCode, 1);
+      assert.ok(result.error);
+      assert.equal(result.error.code, 'INSUFFICIENT_STORAGE_CAPACITY');
+      assert.equal(alertDispatched, false);
+      assert.equal(fs.existsSync(lockFilePath), false);
+    });
+
+    it('should log verified temporary storage capacity in verbose mode when space is sufficient', async () => {
+      const io = createMockIo();
+      const config = {
+        ...validTestConfig,
+        hermesHome: mockHermesHome,
+        tempDir: tempTestDir,
+      };
+
+      const result = await backupCommand({ dryRun: true, verbose: true }, { config, io });
+
+      assert.equal(result.success, true);
+      assert.equal(result.exitCode, 0);
+      const logs = io.getLogs();
+      assert.ok(logs.includes('Verified temporary storage capacity on'));
+    });
   });
 
   describe('testNotifyCommand execution', () => {
@@ -636,6 +738,8 @@ describe('CLI Dispatcher & Command Routing', () => {
       assert.equal(typeof HermesBackup.backupCommand, 'function');
       assert.equal(typeof HermesBackup.testNotifyCommand, 'function');
       assert.equal(typeof HermesBackup.listCommand, 'function');
+      assert.equal(typeof HermesBackup.getAvailableDiskSpace, 'function');
+      assert.equal(typeof HermesBackup.verifyStorageCapacity, 'function');
       assert.equal(typeof HermesBackup.verifySqliteIntegrity, 'function');
       assert.equal(typeof HermesBackup.ProcessLock, 'function');
       assert.equal(typeof HermesBackup.DEFAULT_LOCK_FILENAME, 'string');

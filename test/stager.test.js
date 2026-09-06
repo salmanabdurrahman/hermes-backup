@@ -18,6 +18,8 @@ import {
   resolveBackupPathsSync,
   createStagingDirectory,
   cleanStagingDirectory,
+  getAvailableDiskSpace,
+  verifyStorageCapacity,
   stageLiveSqliteDatabase,
   verifySqliteIntegrity,
   stageBackup,
@@ -1103,6 +1105,138 @@ describe('Include-First Path Resolver & SQLite WAL Stager', () => {
       assert.equal(warnings.length, 1);
       assert.match(warnings[0], /sqlite3 CLI not found on host/i);
 
+      await cleanStagingDirectory(stageResult.stagingDir, testTempDir);
+    });
+  });
+
+  describe('Temporary Storage Capacity Verification', () => {
+    it('should inspect available disk space on existing directory via statfs', async () => {
+      const availableBytes = await getAvailableDiskSpace(testTempDir);
+      assert.equal(typeof availableBytes, 'number');
+      assert.ok(availableBytes > 0);
+      assert.ok(Number.isFinite(availableBytes));
+    });
+
+    it('should resolve to nearest existing ancestor directory when target directory does not exist', async () => {
+      const nonexistentPath = path.join(testTempDir, 'deeply', 'nested', 'nonexistent', 'temp');
+      const availableBytes = await getAvailableDiskSpace(nonexistentPath);
+      assert.equal(typeof availableBytes, 'number');
+      assert.ok(availableBytes > 0);
+    });
+
+    it('should fallback to POSIX df -kP when statfs is unsupported or throws', async () => {
+      const mockStatfs = async () => {
+        const err = new Error('statfs unsupported');
+        err.code = 'ENOTSUP';
+        throw err;
+      };
+
+      const mockExecFileAsync = async (cmd, args) => {
+        assert.equal(cmd, 'df');
+        assert.deepEqual(args, ['-kP', path.resolve(testTempDir)]);
+        return {
+          stdout:
+            'Filesystem 1024-blocks Used Available Capacity Mounted on\n/dev/disk1s1 500000000 200000000 300000000 40% /System/Volumes/Data\n',
+        };
+      };
+
+      const availableBytes = await getAvailableDiskSpace(testTempDir, {
+        statfsFn: mockStatfs,
+        execFileAsync: mockExecFileAsync,
+      });
+
+      assert.equal(availableBytes, 300000000 * 1024);
+    });
+
+    it('should throw structured error when both statfs and df fallback fail', async () => {
+      const mockStatfs = async () => {
+        throw new Error('statfs failed');
+      };
+      const mockExecFileAsync = async () => {
+        throw new Error('df failed');
+      };
+
+      await assert.rejects(
+        async () => {
+          await getAvailableDiskSpace(testTempDir, {
+            statfsFn: mockStatfs,
+            execFileAsync: mockExecFileAsync,
+          });
+        },
+        /Unable to inspect available disk space/i
+      );
+    });
+
+    it('should pass capacity check when available space meets 2x required payload', async () => {
+      const result = await verifyStorageCapacity(testTempDir, 1024, {
+        getAvailableDiskSpace: async () => 2048,
+      });
+
+      assert.equal(result.sufficient, true);
+      assert.equal(result.availableBytes, 2048);
+      assert.equal(result.requiredBytes, 2048);
+    });
+
+    it('should pass capacity check when payload is zero bytes', async () => {
+      const result = await verifyStorageCapacity(testTempDir, 0, {
+        getAvailableDiskSpace: async () => 100,
+      });
+
+      assert.equal(result.sufficient, true);
+      assert.equal(result.requiredBytes, 0);
+    });
+
+    it('should throw INSUFFICIENT_STORAGE_CAPACITY error when available space is less than 2x payload', async () => {
+      await assert.rejects(
+        async () => {
+          await verifyStorageCapacity(testTempDir, 5000, {
+            getAvailableDiskSpace: async () => 9000, // Needs 10000 (2x 5000)
+          });
+        },
+        (err) => {
+          assert.equal(err.code, 'INSUFFICIENT_STORAGE_CAPACITY');
+          assert.equal(err.requiredBytes, 10000);
+          assert.equal(err.availableBytes, 9000);
+          assert.equal(err.totalBytes, 5000);
+          assert.match(err.message, /Insufficient temporary storage capacity/i);
+          return true;
+        }
+      );
+    });
+
+    it('should abort stageBackup before creating staging directory when storage capacity is insufficient', async () => {
+      await fs.promises.writeFile(path.join(mockHermesHome, 'config.yaml'), 'sample: content\n');
+
+      await assert.rejects(
+        async () => {
+          await stageBackup(mockHermesHome, {
+            tempDir: testTempDir,
+            getAvailableDiskSpace: async () => 1, // Only 1 byte available
+          });
+        },
+        (err) => {
+          assert.equal(err.code, 'INSUFFICIENT_STORAGE_CAPACITY');
+          return true;
+        }
+      );
+
+      // Verify no staging directory was left behind or created
+      const entries = await fs.promises.readdir(testTempDir);
+      const stagingDirs = entries.filter((e) => e.startsWith('hermes-backup-'));
+      assert.equal(stagingDirs.length, 0);
+    });
+
+    it('should allow bypassing capacity check in stageBackup with skipCapacityCheck', async () => {
+      await fs.promises.writeFile(path.join(mockHermesHome, 'config.yaml'), 'sample: content\n');
+
+      const stageResult = await stageBackup(mockHermesHome, {
+        tempDir: testTempDir,
+        skipCapacityCheck: true,
+        getAvailableDiskSpace: async () => 1, // Even with insufficient space, skip check
+      });
+
+      assert.ok(stageResult.stagingDir);
+      assert.equal(stageResult.fileCount, 1);
       await cleanStagingDirectory(stageResult.stagingDir, testTempDir);
     });
   });

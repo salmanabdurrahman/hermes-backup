@@ -4,6 +4,7 @@ import os from 'node:os';
 import crypto from 'node:crypto';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
+import { formatBytes } from './storage.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -615,6 +616,127 @@ export async function cleanStagingDirectory(stagingDir, tempDir = '/tmp') {
 }
 
 /**
+ * Retrieves the available disk space in bytes for a target directory or filesystem.
+ * Defends against temporary storage exhaustion on limited or tmpfs partitions.
+ * Supports native fs.promises.statfs with POSIX df -kP fallback.
+ *
+ * @param {string} targetDir - Directory path to inspect
+ * @param {object} [options]
+ * @param {Function} [options.statfsFn] - Custom statfs function (defaults to fs.promises.statfs)
+ * @param {Function} [options.execFileAsync] - Custom execFileAsync runner for POSIX fallback
+ * @returns {Promise<number>} Available bytes on target filesystem
+ */
+export async function getAvailableDiskSpace(targetDir, options = {}) {
+  const {
+    statfsFn = fs.promises.statfs,
+    execFileAsync: execFn = execFileAsync,
+  } = options;
+
+  const rawPath = typeof targetDir === 'string' && targetDir.trim().length > 0
+    ? targetDir.trim()
+    : os.tmpdir();
+
+  // Find nearest existing ancestor directory if targetDir does not exist yet
+  let checkPath = path.resolve(rawPath);
+  while (!fs.existsSync(checkPath)) {
+    const parent = path.dirname(checkPath);
+    if (parent === checkPath) {
+      break;
+    }
+    checkPath = parent;
+  }
+
+  // Primary inspection: native fs.promises.statfs
+  if (typeof statfsFn === 'function') {
+    try {
+      const stat = await statfsFn(checkPath);
+      if (
+        stat &&
+        (typeof stat.bavail === 'number' || typeof stat.bavail === 'bigint') &&
+        (typeof stat.bsize === 'number' || typeof stat.bsize === 'bigint')
+      ) {
+        const bytes = Number(BigInt(stat.bavail) * BigInt(stat.bsize));
+        if (Number.isFinite(bytes) && bytes >= 0) {
+          return bytes;
+        }
+      }
+    } catch {
+      // If statfs is not supported or encounters an issue, proceed to POSIX df fallback
+    }
+  }
+
+  // Secondary inspection: POSIX df -kP fallback
+  try {
+    const { stdout } = await execFn('df', ['-kP', checkPath]);
+    const lines = stdout.trim().split('\n').filter(Boolean);
+    if (lines.length >= 2) {
+      const dataLine = lines[lines.length - 1].trim();
+      const tokens = dataLine.split(/\s+/);
+      // POSIX df -P format: Filesystem 1024-blocks Used Available Capacity Mounted on
+      // Token index 3 is Available 1024-byte blocks
+      if (tokens.length >= 4) {
+        const availBlocks = parseInt(tokens[3], 10);
+        if (Number.isFinite(availBlocks) && availBlocks >= 0) {
+          return availBlocks * 1024;
+        }
+      }
+    }
+  } catch {
+    // df fallback failed as well
+  }
+
+  throw new Error(`Unable to inspect available disk space for path: ${targetDir}`);
+}
+
+/**
+ * Verifies available disk space in the temporary directory before staging.
+ * Requires at least 2x the uncompressed payload size to accommodate
+ * both the staged uncompressed files and the compressed archive.
+ *
+ * @param {string} tempDir - Path to temporary directory
+ * @param {number} totalBytes - Total uncompressed bytes of files to be backed up
+ * @param {object} [options]
+ * @param {number} [options.multiplier=2] - Multiplier for required capacity (staging + archive)
+ * @param {Function} [options.getAvailableDiskSpace] - Custom function to inspect available disk space
+ * @param {Function} [options.statfsFn] - Optional custom statfs function
+ * @param {Function} [options.execFileAsync] - Optional custom execFileAsync runner
+ * @returns {Promise<{ availableBytes: number, requiredBytes: number, sufficient: boolean }>}
+ */
+export async function verifyStorageCapacity(tempDir, totalBytes, options = {}) {
+  const {
+    multiplier = 2,
+    getAvailableDiskSpace: diskSpaceFn = getAvailableDiskSpace,
+    statfsFn,
+    execFileAsync: execFn,
+  } = options;
+
+  const numericTotalBytes = typeof totalBytes === 'number' && totalBytes > 0 ? totalBytes : 0;
+  const requiredBytes = numericTotalBytes * multiplier;
+
+  const availableBytes = await diskSpaceFn(tempDir, {
+    statfsFn,
+    execFileAsync: execFn,
+  });
+
+  if (availableBytes < requiredBytes) {
+    const error = new Error(
+      `Insufficient temporary storage capacity in "${tempDir}". Required at least ${formatBytes(requiredBytes)} (2x payload estimate for staging and archive), but only ${formatBytes(availableBytes)} available.`
+    );
+    error.code = 'INSUFFICIENT_STORAGE_CAPACITY';
+    error.availableBytes = availableBytes;
+    error.requiredBytes = requiredBytes;
+    error.totalBytes = numericTotalBytes;
+    throw error;
+  }
+
+  return {
+    availableBytes,
+    requiredBytes,
+    sufficient: true,
+  };
+}
+
+/**
  * Verifies structural integrity of a staged SQLite database file.
  * Runs PRAGMA integrity_check; and validates output equals 'ok'.
  * If sqlite3 CLI is absent (ENOENT), passes safely with warning.
@@ -741,6 +863,10 @@ export async function stageBackup(hermesHome, options = {}) {
     onWarning,
     sqliteBinary,
     execFileAsync: execFn,
+    statfsFn,
+    getAvailableDiskSpace: customGetAvailableDiskSpace,
+    verifyStorageCapacity: customVerifyStorageCapacity,
+    skipCapacityCheck = false,
   } = options;
 
   let warnedMissingCli = false;
@@ -760,6 +886,16 @@ export async function stageBackup(hermesHome, options = {}) {
   let totalBytes = 0;
   for (const file of resolvedFiles) {
     totalBytes += file.size;
+  }
+
+  // Pre-flight temporary storage capacity check (minimum 2x total payload size: staging + archive)
+  if (!skipCapacityCheck) {
+    const capacityCheckFn = customVerifyStorageCapacity || verifyStorageCapacity;
+    await capacityCheckFn(tempDir, totalBytes, {
+      statfsFn,
+      execFileAsync: execFn,
+      getAvailableDiskSpace: customGetAvailableDiskSpace,
+    });
   }
 
   if (dryRun) {

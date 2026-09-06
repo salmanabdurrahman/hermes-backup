@@ -163,6 +163,10 @@ export async function backupCommand(options = {}, context = {}) {
     s3Client,
     lockFilePath: customLockFilePath,
     processLock: customProcessLock,
+    statfsFn,
+    getAvailableDiskSpace: customGetAvailableDiskSpace,
+    verifyStorageCapacity: customVerifyStorageCapacity,
+    skipCapacityCheck,
   } = context;
 
   const config = customConfig || loadConfig(env);
@@ -217,12 +221,19 @@ export async function backupCommand(options = {}, context = {}) {
           log(`[WARN] ${msg}`);
         }
       },
+      statfsFn,
+      getAvailableDiskSpace: customGetAvailableDiskSpace,
+      verifyStorageCapacity: customVerifyStorageCapacity,
+      skipCapacityCheck,
     });
 
     stagingDir = stageResult.stagingDir;
 
     log(
       `[INFO] Discovered ${stageResult.fileCount} files (${formatBytes(stageResult.totalBytes)})`
+    );
+    logVerbose(
+      `[INFO] Verified temporary storage capacity on ${config.tempDir} (minimum ${formatBytes(stageResult.totalBytes * 2)} required)`
     );
     log('[INFO] Staged SQLite databases with WAL companion files');
     if (!dryRun) {

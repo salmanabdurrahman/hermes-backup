@@ -25,6 +25,8 @@ export {
   resolveBackupPathsSync,
   createStagingDirectory,
   cleanStagingDirectory,
+  getAvailableDiskSpace,
+  verifyStorageCapacity,
   stageLiveSqliteDatabase,
   verifySqliteIntegrity,
   stageBackup,
