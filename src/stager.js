@@ -189,6 +189,47 @@ export function formatBackupTimestamp(date = new Date()) {
 }
 
 /**
+ * Verifies whether a target path resides within an authorized base directory.
+ * Defends against symlink escape and directory traversal.
+ *
+ * @param {string} targetPath - Path to test
+ * @param {string} baseDir - Canonical root boundary (HERMES_HOME)
+ * @returns {Promise<boolean>} True if strictly inside baseDir
+ */
+export async function isPathWithinBase(targetPath, baseDir) {
+  try {
+    const realTarget = await fs.promises.realpath(targetPath);
+    const realBase = await fs.promises.realpath(baseDir);
+
+    const relative = path.relative(realBase, realTarget);
+    return !relative.startsWith('..' + path.sep) && relative !== '..' && !path.isAbsolute(relative);
+  } catch {
+    // If realpath fails (broken symlink, non-existent, or permission denied), reject safely
+    return false;
+  }
+}
+
+/**
+ * Synchronously verifies whether a target path resides within an authorized base directory.
+ * Defends against symlink escape and directory traversal.
+ *
+ * @param {string} targetPath - Path to test
+ * @param {string} baseDir - Canonical root boundary (HERMES_HOME)
+ * @returns {boolean} True if strictly inside baseDir
+ */
+export function isPathWithinBaseSync(targetPath, baseDir) {
+  try {
+    const realTarget = fs.realpathSync(targetPath);
+    const realBase = fs.realpathSync(baseDir);
+
+    const relative = path.relative(realBase, realTarget);
+    return !relative.startsWith('..' + path.sep) && relative !== '..' && !path.isAbsolute(relative);
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Recursively scans a directory and collects all file paths relative to baseDir.
  * Protects against infinite loops from circular symlinks.
  *
@@ -198,6 +239,11 @@ export function formatBackupTimestamp(date = new Date()) {
  * @returns {Promise<string[]>} List of relative file paths
  */
 async function scanDirectory(currentDir, baseDir, visitedDirs = new Set()) {
+  const isDirSafe = await isPathWithinBase(currentDir, baseDir);
+  if (!isDirSafe) {
+    return [];
+  }
+
   let realCurrent;
   try {
     realCurrent = await fs.promises.realpath(currentDir);
@@ -248,6 +294,11 @@ async function scanDirectory(currentDir, baseDir, visitedDirs = new Set()) {
  * @returns {string[]}
  */
 function scanDirectorySync(currentDir, baseDir, visitedDirs = new Set()) {
+  const isDirSafe = isPathWithinBaseSync(currentDir, baseDir);
+  if (!isDirSafe) {
+    return [];
+  }
+
   let realCurrent;
   try {
     realCurrent = fs.realpathSync(currentDir);
@@ -317,6 +368,11 @@ export function resolveBackupPathsSync(hermesHome, options = {}) {
 
     const absolutePath = path.join(hermesHome, normalized);
     try {
+      const isSafe = isPathWithinBaseSync(absolutePath, hermesHome);
+      if (!isSafe) {
+        return;
+      }
+
       if (fs.existsSync(absolutePath)) {
         const fileStat = fs.statSync(absolutePath);
         if (fileStat.isFile()) {
@@ -334,6 +390,8 @@ export function resolveBackupPathsSync(hermesHome, options = {}) {
               const compAbs = path.join(hermesHome, compRel);
               if (fs.existsSync(compAbs)) {
                 try {
+                  const isCompSafe = isPathWithinBaseSync(compAbs, hermesHome);
+                  if (!isCompSafe) continue;
                   const compStat = fs.statSync(compAbs);
                   if (compStat.isFile()) {
                     resolvedMap.set(compRel, {
@@ -367,6 +425,11 @@ export function resolveBackupPathsSync(hermesHome, options = {}) {
     }
 
     try {
+      const isSafe = isPathWithinBaseSync(targetPath, hermesHome);
+      if (!isSafe) {
+        continue;
+      }
+
       const targetStat = fs.statSync(targetPath);
       if (targetStat.isDirectory()) {
         const dirFiles = scanDirectorySync(targetPath, hermesHome);
@@ -421,6 +484,11 @@ export async function resolveBackupPaths(hermesHome, options = {}) {
 
     const absolutePath = path.join(hermesHome, normalized);
     try {
+      const isSafe = await isPathWithinBase(absolutePath, hermesHome);
+      if (!isSafe) {
+        return;
+      }
+
       const fileStat = await fs.promises.stat(absolutePath);
       if (fileStat.isFile()) {
         resolvedMap.set(normalized, {
@@ -436,6 +504,8 @@ export async function resolveBackupPaths(hermesHome, options = {}) {
             if (isExcluded(compRel)) continue;
             const compAbs = path.join(hermesHome, compRel);
             try {
+              const isCompSafe = await isPathWithinBase(compAbs, hermesHome);
+              if (!isCompSafe) continue;
               const compStat = await fs.promises.stat(compAbs);
               if (compStat.isFile()) {
                 resolvedMap.set(compRel, {
@@ -463,6 +533,11 @@ export async function resolveBackupPaths(hermesHome, options = {}) {
 
     const targetPath = path.join(hermesHome, normalizedItem);
     try {
+      const isSafe = await isPathWithinBase(targetPath, hermesHome);
+      if (!isSafe) {
+        continue;
+      }
+
       const targetStat = await fs.promises.stat(targetPath);
       if (targetStat.isDirectory()) {
         const dirFiles = await scanDirectory(targetPath, hermesHome);

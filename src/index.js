@@ -19,6 +19,8 @@ export {
   isExcluded,
   getSqliteCompanionPaths,
   formatBackupTimestamp,
+  isPathWithinBase,
+  isPathWithinBaseSync,
   resolveBackupPaths,
   resolveBackupPathsSync,
   createStagingDirectory,

@@ -12,6 +12,8 @@ import {
   isExcluded,
   getSqliteCompanionPaths,
   formatBackupTimestamp,
+  isPathWithinBase,
+  isPathWithinBaseSync,
   resolveBackupPaths,
   resolveBackupPathsSync,
   createStagingDirectory,
@@ -292,6 +294,270 @@ describe('Include-First Path Resolver & SQLite WAL Stager', () => {
       const syncRes = resolveBackupPathsSync(mockHermesHome);
 
       assert.deepEqual(asyncRes, syncRes);
+    });
+  });
+
+  describe('Path Boundary Validation & Symlink Traversal Mitigation', () => {
+    it('should validate whether paths are strictly within base directory', async () => {
+      const internalFile = path.join(mockHermesHome, 'config.yaml');
+      await fs.promises.writeFile(internalFile, 'test');
+
+      const internalSubdir = path.join(mockHermesHome, 'skills/demo');
+      await fs.promises.mkdir(internalSubdir, { recursive: true });
+      const nestedFile = path.join(internalSubdir, 'SKILL.md');
+      await fs.promises.writeFile(nestedFile, 'content');
+
+      // Internal paths return true
+      assert.equal(await isPathWithinBase(internalFile, mockHermesHome), true);
+      assert.equal(await isPathWithinBase(nestedFile, mockHermesHome), true);
+      assert.equal(await isPathWithinBase(mockHermesHome, mockHermesHome), true);
+      assert.equal(isPathWithinBaseSync(internalFile, mockHermesHome), true);
+      assert.equal(isPathWithinBaseSync(nestedFile, mockHermesHome), true);
+      assert.equal(isPathWithinBaseSync(mockHermesHome, mockHermesHome), true);
+
+      // External system path returns false
+      assert.equal(await isPathWithinBase('/etc/passwd', mockHermesHome), false);
+      assert.equal(isPathWithinBaseSync('/etc/passwd', mockHermesHome), false);
+
+      // Parent directory traversal returns false
+      const parentDir = path.dirname(mockHermesHome);
+      assert.equal(await isPathWithinBase(parentDir, mockHermesHome), false);
+      assert.equal(isPathWithinBaseSync(parentDir, mockHermesHome), false);
+
+      // Non-existent target path returns false
+      const nonExistent = path.join(mockHermesHome, 'does-not-exist.txt');
+      assert.equal(await isPathWithinBase(nonExistent, mockHermesHome), false);
+      assert.equal(isPathWithinBaseSync(nonExistent, mockHermesHome), false);
+    });
+
+    it('should reject symlinks in whitelist directories pointing to external system files', async () => {
+      const skillsDir = path.join(mockHermesHome, 'skills/malicious_skill');
+      await fs.promises.mkdir(skillsDir, { recursive: true });
+      await fs.promises.writeFile(path.join(skillsDir, 'safe_file.txt'), 'safe');
+
+      // Create symlink pointing to /etc/passwd
+      const passwdSymlink = path.join(skillsDir, 'passwd_link');
+      try {
+        await fs.promises.symlink('/etc/passwd', passwdSymlink);
+      } catch {
+        // Skip if environment restricts symlinks
+      }
+
+      // Create external dummy file outside HERMES_HOME
+      const externalSecretFile = path.join(testTempDir, 'external_secret.env');
+      await fs.promises.writeFile(externalSecretFile, 'DATABASE_PASSWORD=secret');
+
+      const secretSymlink = path.join(skillsDir, 'stolen_secret.env');
+      try {
+        await fs.promises.symlink(externalSecretFile, secretSymlink);
+      } catch {
+        // Skip if environment restricts symlinks
+      }
+
+      const resolved = await resolveBackupPaths(mockHermesHome);
+      const relativePaths = resolved.map((r) => r.relativePath);
+
+      // Safe file must be included
+      assert.ok(relativePaths.includes('skills/malicious_skill/safe_file.txt'));
+
+      // External symlinks must be strictly excluded
+      assert.ok(!relativePaths.includes('skills/malicious_skill/passwd_link'));
+      assert.ok(!relativePaths.includes('skills/malicious_skill/stolen_secret.env'));
+
+      // Synchronous resolver must match behavior
+      const resolvedSync = resolveBackupPathsSync(mockHermesHome);
+      const relativePathsSync = resolvedSync.map((r) => r.relativePath);
+      assert.ok(relativePathsSync.includes('skills/malicious_skill/safe_file.txt'));
+      assert.ok(!relativePathsSync.includes('skills/malicious_skill/passwd_link'));
+      assert.ok(!relativePathsSync.includes('skills/malicious_skill/stolen_secret.env'));
+    });
+
+    it('should reject symlinks in plugins pointing to external directories', async () => {
+      const pluginsDir = path.join(mockHermesHome, 'plugins/custom_plugin');
+      await fs.promises.mkdir(pluginsDir, { recursive: true });
+      await fs.promises.writeFile(path.join(pluginsDir, 'plugin.json'), '{}');
+
+      // Create external directory with files outside HERMES_HOME
+      const externalDir = path.join(testTempDir, 'external_system_dir');
+      await fs.promises.mkdir(externalDir, { recursive: true });
+      await fs.promises.writeFile(path.join(externalDir, 'sensitive.txt'), 'sensitive data');
+
+      // Create symlink pointing to external directory
+      const externalDirSymlink = path.join(pluginsDir, 'linked_external_dir');
+      try {
+        await fs.promises.symlink(externalDir, externalDirSymlink, 'dir');
+      } catch {
+        // Skip if symlinks restricted
+      }
+
+      const resolved = await resolveBackupPaths(mockHermesHome);
+      const relativePaths = resolved.map((r) => r.relativePath);
+
+      assert.ok(relativePaths.includes('plugins/custom_plugin/plugin.json'));
+      assert.ok(!relativePaths.some((p) => p.includes('linked_external_dir')));
+      assert.ok(!relativePaths.some((p) => p.includes('sensitive.txt')));
+    });
+
+    it('should safely omit broken or dangling symlinks without throwing', async () => {
+      const skillsDir = path.join(mockHermesHome, 'skills/broken_links');
+      await fs.promises.mkdir(skillsDir, { recursive: true });
+      await fs.promises.writeFile(path.join(skillsDir, 'valid.txt'), 'valid');
+
+      const brokenLink = path.join(skillsDir, 'dangling_link.txt');
+      try {
+        await fs.promises.symlink(path.join(mockHermesHome, 'missing_target.txt'), brokenLink);
+      } catch {
+        // Skip if symlinks restricted
+      }
+
+      const resolved = await resolveBackupPaths(mockHermesHome);
+      const relativePaths = resolved.map((r) => r.relativePath);
+
+      assert.ok(relativePaths.includes('skills/broken_links/valid.txt'));
+      assert.ok(!relativePaths.includes('skills/broken_links/dangling_link.txt'));
+    });
+
+    it('should resolve and stage legitimate internal symlinks within HERMES_HOME', async () => {
+      // Create legitimate internal target file
+      await fs.promises.mkdir(path.join(mockHermesHome, 'memories'), { recursive: true });
+      const targetFile = path.join(mockHermesHome, 'memories/SHARED_NOTE.md');
+      await fs.promises.writeFile(targetFile, '# Shared Internal Knowledge');
+
+      // Create internal symlink inside skills referencing memories
+      const skillsDir = path.join(mockHermesHome, 'skills/internal_ref_skill');
+      await fs.promises.mkdir(skillsDir, { recursive: true });
+
+      const internalLink = path.join(skillsDir, 'REFERENCE.md');
+      try {
+        await fs.promises.symlink(targetFile, internalLink);
+      } catch {
+        // Skip if symlinks restricted
+      }
+
+      const resolved = await resolveBackupPaths(mockHermesHome);
+      const relativePaths = resolved.map((r) => r.relativePath);
+
+      assert.ok(relativePaths.includes('memories/SHARED_NOTE.md'));
+      assert.ok(relativePaths.includes('skills/internal_ref_skill/REFERENCE.md'));
+
+      // Test staging execution: verify staged content matches
+      const stageResult = await stageBackup(mockHermesHome, { tempDir: testTempDir });
+      assert.ok(stageResult.stagingDir);
+
+      const stagedRef = path.join(stageResult.stagingDir, 'skills/internal_ref_skill/REFERENCE.md');
+      assert.ok(fs.existsSync(stagedRef));
+      assert.equal(
+        await fs.promises.readFile(stagedRef, 'utf8'),
+        '# Shared Internal Knowledge'
+      );
+
+      await cleanStagingDirectory(stageResult.stagingDir, testTempDir);
+    });
+
+    it('should prevent external symlink targets from being copied during staging', async () => {
+      const skillsDir = path.join(mockHermesHome, 'skills/exfiltration_attempt');
+      await fs.promises.mkdir(skillsDir, { recursive: true });
+      await fs.promises.writeFile(path.join(skillsDir, 'legit.txt'), 'legit payload');
+
+      // Create external file with private data
+      const privateFile = path.join(testTempDir, 'host_secret_shadow');
+      await fs.promises.writeFile(privateFile, 'root:$6$systempasswordhash');
+
+      // Symlink inside skills pointing to external private file
+      const linkPath = path.join(skillsDir, 'shadow_symlink');
+      try {
+        await fs.promises.symlink(privateFile, linkPath);
+      } catch {
+        // Skip if symlinks restricted
+      }
+
+      const stageResult = await stageBackup(mockHermesHome, { tempDir: testTempDir });
+      assert.ok(stageResult.stagingDir);
+
+      const stagedLegit = path.join(stageResult.stagingDir, 'skills/exfiltration_attempt/legit.txt');
+      const stagedShadow = path.join(stageResult.stagingDir, 'skills/exfiltration_attempt/shadow_symlink');
+
+      assert.ok(fs.existsSync(stagedLegit));
+      assert.ok(!fs.existsSync(stagedShadow));
+
+      await cleanStagingDirectory(stageResult.stagingDir, testTempDir);
+    });
+
+    it('should block relative symlinks that traverse above HERMES_HOME', async () => {
+      const skillsDir = path.join(mockHermesHome, 'skills/relative_escape');
+      await fs.promises.mkdir(skillsDir, { recursive: true });
+
+      // Create external file in testTempDir
+      const secretFile = path.join(testTempDir, 'escape_secret.key');
+      await fs.promises.writeFile(secretFile, 'SUPER_SECRET_KEY');
+
+      // Create relative symlink: ../../../escape_secret.key
+      const relativeEscapeLink = path.join(skillsDir, 'relative_link');
+      const relativeTarget = path.relative(skillsDir, secretFile);
+      try {
+        await fs.promises.symlink(relativeTarget, relativeEscapeLink);
+      } catch {
+        // Skip if symlinks restricted
+      }
+
+      const resolved = await resolveBackupPaths(mockHermesHome);
+      const relativePaths = resolved.map((r) => r.relativePath);
+
+      assert.ok(!relativePaths.includes('skills/relative_escape/relative_link'));
+
+      const resolvedSync = resolveBackupPathsSync(mockHermesHome);
+      const relativePathsSync = resolvedSync.map((r) => r.relativePath);
+      assert.ok(!relativePathsSync.includes('skills/relative_escape/relative_link'));
+    });
+
+    it('should block chained symlinks that terminate outside HERMES_HOME', async () => {
+      const skillsDir = path.join(mockHermesHome, 'skills/chained_escape');
+      await fs.promises.mkdir(skillsDir, { recursive: true });
+
+      // Create external file
+      const externalTarget = path.join(testTempDir, 'deep_secret.txt');
+      await fs.promises.writeFile(externalTarget, 'TOP_SECRET');
+
+      // intermediate symlink in mockHermesHome
+      const hop1 = path.join(skillsDir, 'hop1');
+      const hop2 = path.join(skillsDir, 'hop2');
+
+      try {
+        await fs.promises.symlink(externalTarget, hop1);
+        await fs.promises.symlink(hop1, hop2);
+      } catch {
+        // Skip if symlinks restricted
+      }
+
+      const resolved = await resolveBackupPaths(mockHermesHome);
+      const relativePaths = resolved.map((r) => r.relativePath);
+
+      assert.ok(!relativePaths.includes('skills/chained_escape/hop1'));
+      assert.ok(!relativePaths.includes('skills/chained_escape/hop2'));
+    });
+
+    it('should block root whitelist items when configured as symlinks pointing outside HERMES_HOME', async () => {
+      // Create external files
+      const externalEnv = path.join(testTempDir, 'external_system.env');
+      await fs.promises.writeFile(externalEnv, 'AWS_SECRET_KEY=external');
+
+      // Make mockHermesHome/.env a symlink pointing to external file
+      const envSymlink = path.join(mockHermesHome, '.env');
+      try {
+        await fs.promises.symlink(externalEnv, envSymlink);
+      } catch {
+        // Skip if symlinks restricted
+      }
+
+      const resolved = await resolveBackupPaths(mockHermesHome);
+      const relativePaths = resolved.map((r) => r.relativePath);
+
+      // Root .env symlink pointing outside must be excluded
+      assert.ok(!relativePaths.includes('.env'));
+
+      const resolvedSync = resolveBackupPathsSync(mockHermesHome);
+      const relativePathsSync = resolvedSync.map((r) => r.relativePath);
+      assert.ok(!relativePathsSync.includes('.env'));
     });
   });
 
