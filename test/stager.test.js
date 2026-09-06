@@ -1085,6 +1085,31 @@ describe('Include-First Path Resolver & SQLite WAL Stager', () => {
       await cleanStagingDirectory(stageResult.stagingDir, testTempDir);
     });
 
+    it('should preserve staged WAL companion files during post-staging SQLite structural integrity check', async () => {
+      const mnemosyneDir = path.join(mockHermesHome, 'mnemosyne', 'data');
+      await fs.promises.mkdir(mnemosyneDir, { recursive: true });
+      const mnemosyneDb = path.join(mnemosyneDir, 'mnemosyne.db');
+      execFileSync('sqlite3', [
+        mnemosyneDb,
+        `
+        PRAGMA journal_mode = WAL;
+        CREATE TABLE memories (id INTEGER PRIMARY KEY, note TEXT);
+        INSERT INTO memories VALUES (1, 'wal-preserved-memory');
+        `,
+      ]);
+      await fs.promises.writeFile(`${mnemosyneDb}-wal`, 'wal-content-to-preserve');
+
+      const stageResult = await stageBackup(mockHermesHome, { tempDir: testTempDir });
+      assert.ok(stageResult.stagingDir);
+
+      const stagedWal = path.join(stageResult.stagingDir, 'mnemosyne/data/mnemosyne.db-wal');
+      assert.ok(fs.existsSync(stagedWal), 'Staged WAL file must not be deleted by integrity check');
+      const walContent = await fs.promises.readFile(stagedWal, 'utf8');
+      assert.equal(walContent, 'wal-content-to-preserve');
+
+      await cleanStagingDirectory(stageResult.stagingDir, testTempDir);
+    });
+
     it('should safely bypass post-staging integrity check when sqlite3 binary is missing', async () => {
       const mnemosyneDir = path.join(mockHermesHome, 'mnemosyne', 'data');
       await fs.promises.mkdir(mnemosyneDir, { recursive: true });

@@ -755,12 +755,35 @@ export async function verifySqliteIntegrity(dbPath, options = {}) {
     onWarning,
   } = options;
 
+  const walPath = `${dbPath}-wal`;
+  const shmPath = `${dbPath}-shm`;
+  const walExisted = fs.existsSync(walPath);
+  const shmExisted = fs.existsSync(shmPath);
+
+  let walBackup = null;
+  let shmBackup = null;
+  if (walExisted) {
+    try {
+      walBackup = await fs.promises.readFile(walPath);
+    } catch {
+      // Ignore read error
+    }
+  }
+  if (shmExisted) {
+    try {
+      shmBackup = await fs.promises.readFile(shmPath);
+    } catch {
+      // Ignore read error
+    }
+  }
+
+  let isValid = false;
   try {
     const { stdout } = await execFn(sqliteBinary, [
       dbPath,
       'PRAGMA integrity_check;',
     ]);
-    return typeof stdout === 'string' && stdout.trim() === 'ok';
+    isValid = typeof stdout === 'string' && stdout.trim() === 'ok';
   } catch (err) {
     if (err && err.code === 'ENOENT') {
       if (typeof onWarning === 'function') {
@@ -770,8 +793,43 @@ export async function verifySqliteIntegrity(dbPath, options = {}) {
       }
       return true;
     }
-    return false;
+    isValid = false;
   }
+
+  // Restore pre-existing companion files if modified or deleted during integrity check
+  if (walExisted && walBackup !== null) {
+    try {
+      await fs.promises.writeFile(walPath, walBackup);
+    } catch {
+      // Ignore restore error
+    }
+  }
+  if (shmExisted && shmBackup !== null) {
+    try {
+      await fs.promises.writeFile(shmPath, shmBackup);
+    } catch {
+      // Ignore restore error
+    }
+  }
+
+  // Clean up transient companion files created by sqlite3 during integrity check
+  // if they were not originally present
+  if (!walExisted && fs.existsSync(walPath)) {
+    try {
+      await fs.promises.unlink(walPath);
+    } catch {
+      // Ignore cleanup error
+    }
+  }
+  if (!shmExisted && fs.existsSync(shmPath)) {
+    try {
+      await fs.promises.unlink(shmPath);
+    } catch {
+      // Ignore cleanup error
+    }
+  }
+
+  return isValid;
 }
 
 /**
@@ -947,33 +1005,11 @@ export async function stageBackup(hermesHome, options = {}) {
     // Verify post-staging SQLite structural integrity across all staged .db files
     for (const stagedFile of stagedFiles) {
       if (stagedFile.destPath && stagedFile.relativePath.toLowerCase().endsWith('.db')) {
-        const walPath = `${stagedFile.destPath}-wal`;
-        const shmPath = `${stagedFile.destPath}-shm`;
-        const walExisted = fs.existsSync(walPath);
-        const shmExisted = fs.existsSync(shmPath);
-
         const isValid = await verifySqliteIntegrity(stagedFile.destPath, {
           sqliteBinary,
           execFileAsync: execFn,
           onWarning: stageWarning,
         });
-
-        // Clean up transient companion files created by sqlite3 during integrity check
-        // if they were not originally staged (e.g. state.db companions)
-        if (!walExisted && fs.existsSync(walPath)) {
-          try {
-            await fs.promises.unlink(walPath);
-          } catch {
-            // Ignore cleanup error
-          }
-        }
-        if (!shmExisted && fs.existsSync(shmPath)) {
-          try {
-            await fs.promises.unlink(shmPath);
-          } catch {
-            // Ignore cleanup error
-          }
-        }
 
         if (!isValid) {
           const error = new Error(
