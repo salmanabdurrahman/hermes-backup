@@ -65,6 +65,12 @@ export {
 } from './notifier.js';
 
 export {
+  DEFAULT_LOCK_FILENAME,
+  ProcessLock,
+  withProcessLock,
+} from './lock.js';
+
+export {
   CLI_VERSION,
   COMMANDS,
   HELP_TEXT,

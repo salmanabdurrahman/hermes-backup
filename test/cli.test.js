@@ -17,6 +17,11 @@ import {
   COMMANDS,
   HELP_TEXT,
 } from '../src/cli.js';
+import {
+  ProcessLock,
+  DEFAULT_LOCK_FILENAME,
+  withProcessLock,
+} from '../src/lock.js';
 import * as HermesBackup from '../src/index.js';
 import { PutObjectCommand, ListObjectsV2Command, DeleteObjectsCommand } from '@aws-sdk/client-s3';
 
@@ -373,6 +378,76 @@ describe('CLI Dispatcher & Command Routing', () => {
       const errors = io.getErrors();
       assert.ok(errors.includes('[ERROR] Backup failed: SQLite integrity check failed for staged database: mnemosyne/data/mnemosyne.db'));
     });
+
+    it('should acquire process lock during backup and release it upon successful completion', async () => {
+      const io = createMockIo();
+      const config = {
+        ...validTestConfig,
+        hermesHome: mockHermesHome,
+        tempDir: tempTestDir,
+      };
+
+      const lockFilePath = path.join(tempTestDir, DEFAULT_LOCK_FILENAME);
+      assert.equal(fs.existsSync(lockFilePath), false);
+
+      const result = await backupCommand({ dryRun: true, verbose: true }, { config, io });
+
+      assert.equal(result.success, true);
+      assert.equal(result.exitCode, 0);
+
+      // Lock file must be cleanly released upon completion
+      assert.equal(fs.existsSync(lockFilePath), false);
+      const logs = io.getLogs();
+      assert.ok(logs.includes('Acquired process lock:'));
+      assert.ok(logs.includes('Released process lock:'));
+    });
+
+    it('should release process lock upon abnormal termination or failure', async () => {
+      const io = createMockIo();
+      const config = {
+        ...validTestConfig,
+        hermesHome: path.join(tempTestDir, 'non-existent-hermes-dir'),
+        tempDir: tempTestDir,
+      };
+
+      const lockFilePath = path.join(tempTestDir, DEFAULT_LOCK_FILENAME);
+
+      const result = await backupCommand({ dryRun: true }, { config, io });
+
+      assert.equal(result.success, false);
+      assert.equal(result.exitCode, 1);
+
+      // Lock file must be cleanly released despite the failure
+      assert.equal(fs.existsSync(lockFilePath), false);
+    });
+
+    it('should abort backup and preserve active lock file when another process holds the lock', async () => {
+      const io = createMockIo();
+      const config = {
+        ...validTestConfig,
+        hermesHome: mockHermesHome,
+        tempDir: tempTestDir,
+      };
+
+      const lockFilePath = path.join(tempTestDir, DEFAULT_LOCK_FILENAME);
+      // Simulate an active process holding the lock
+      await fs.promises.writeFile(lockFilePath, String(process.pid));
+
+      const result = await backupCommand({ dryRun: true }, { config, io });
+
+      assert.equal(result.success, false);
+      assert.equal(result.exitCode, 1);
+      assert.ok(result.error);
+      assert.match(result.error.message, /Backup operation already active on PID/);
+
+      // Active lock file must NOT be prematurely deleted
+      assert.equal(fs.existsSync(lockFilePath), true);
+      const remainingContent = await fs.promises.readFile(lockFilePath, 'utf8');
+      assert.equal(remainingContent.trim(), String(process.pid));
+
+      // Clean up test lock file
+      await fs.promises.unlink(lockFilePath);
+    });
   });
 
   describe('testNotifyCommand execution', () => {
@@ -562,6 +637,9 @@ describe('CLI Dispatcher & Command Routing', () => {
       assert.equal(typeof HermesBackup.testNotifyCommand, 'function');
       assert.equal(typeof HermesBackup.listCommand, 'function');
       assert.equal(typeof HermesBackup.verifySqliteIntegrity, 'function');
+      assert.equal(typeof HermesBackup.ProcessLock, 'function');
+      assert.equal(typeof HermesBackup.DEFAULT_LOCK_FILENAME, 'string');
+      assert.equal(typeof HermesBackup.withProcessLock, 'function');
       assert.equal(typeof HermesBackup.runCli, 'function');
       assert.equal(HermesBackup.CLI_VERSION, '1.0.0');
       assert.equal(typeof HermesBackup.HELP_TEXT, 'string');
@@ -597,6 +675,143 @@ describe('CLI Dispatcher & Command Routing', () => {
           return true;
         }
       );
+    });
+  });
+
+  describe('ProcessLock concurrency locking', () => {
+    let lockTestDir;
+    let lockFilePath;
+
+    beforeEach(async () => {
+      lockTestDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'hermes-lock-test-'));
+      lockFilePath = path.join(lockTestDir, 'test-process.lock');
+    });
+
+    afterEach(async () => {
+      if (lockTestDir && fs.existsSync(lockTestDir)) {
+        await fs.promises.rm(lockTestDir, { recursive: true, force: true });
+      }
+    });
+
+    it('should atomically acquire lock and write current PID to lock file', async () => {
+      const lock = new ProcessLock(lockFilePath);
+      assert.equal(lock.isLocked, false);
+
+      const acquired = await lock.acquire();
+      assert.equal(acquired, true);
+      assert.equal(lock.isLocked, true);
+      assert.equal(fs.existsSync(lockFilePath), true);
+
+      const content = await fs.promises.readFile(lockFilePath, 'utf8');
+      assert.equal(content.trim(), String(process.pid));
+
+      await lock.release();
+      assert.equal(lock.isLocked, false);
+      assert.equal(fs.existsSync(lockFilePath), false);
+    });
+
+    it('should abort and throw when lock is held by an active PID', async () => {
+      // Simulate another active process (using current process PID)
+      await fs.promises.writeFile(lockFilePath, String(process.pid));
+
+      const lock = new ProcessLock(lockFilePath);
+      await assert.rejects(
+        () => lock.acquire(),
+        (err) => {
+          assert.match(err.message, /Backup operation already active on PID/);
+          return true;
+        }
+      );
+
+      // Active lock file must NOT be deleted
+      assert.equal(fs.existsSync(lockFilePath), true);
+      const content = await fs.promises.readFile(lockFilePath, 'utf8');
+      assert.equal(content.trim(), String(process.pid));
+    });
+
+    it('should detect stale lock when PID is dead, unlink it, and successfully reacquire', async () => {
+      // Find a dead PID
+      let deadPid = 999999;
+      while (deadPid > 100000) {
+        try {
+          process.kill(deadPid, 0);
+          deadPid--;
+        } catch (err) {
+          if (err.code === 'ESRCH') break;
+          deadPid--;
+        }
+      }
+
+      await fs.promises.writeFile(lockFilePath, String(deadPid));
+
+      const lock = new ProcessLock(lockFilePath);
+      const acquired = await lock.acquire();
+      assert.equal(acquired, true);
+      assert.equal(lock.isLocked, true);
+
+      const content = await fs.promises.readFile(lockFilePath, 'utf8');
+      assert.equal(content.trim(), String(process.pid));
+
+      await lock.release();
+      assert.equal(fs.existsSync(lockFilePath), false);
+    });
+
+    it('should detect and clean corrupted or empty lock file and reacquire', async () => {
+      // Corrupt content
+      await fs.promises.writeFile(lockFilePath, 'INVALID_PID_DATA');
+
+      const lock = new ProcessLock(lockFilePath);
+      const acquired = await lock.acquire();
+      assert.equal(acquired, true);
+      assert.equal(lock.isLocked, true);
+
+      const content = await fs.promises.readFile(lockFilePath, 'utf8');
+      assert.equal(content.trim(), String(process.pid));
+
+      await lock.release();
+      assert.equal(fs.existsSync(lockFilePath), false);
+    });
+
+    it('should guard release against deleting lock file belonging to another process', async () => {
+      const lock = new ProcessLock(lockFilePath);
+      await lock.acquire();
+      assert.equal(lock.isLocked, true);
+
+      // Overwrite lock file with another PID
+      await fs.promises.writeFile(lockFilePath, '123456');
+
+      await lock.release();
+      assert.equal(lock.isLocked, false);
+
+      // Lock file must still exist because recorded PID didn't match
+      assert.equal(fs.existsSync(lockFilePath), true);
+      const content = await fs.promises.readFile(lockFilePath, 'utf8');
+      assert.equal(content.trim(), '123456');
+    });
+
+    it('should execute action safely with withProcessLock helper', async () => {
+      let executed = false;
+      const result = await withProcessLock(lockFilePath, async (lock) => {
+        assert.equal(lock.isLocked, true);
+        assert.equal(fs.existsSync(lockFilePath), true);
+        executed = true;
+        return 'success-value';
+      });
+
+      assert.equal(executed, true);
+      assert.equal(result, 'success-value');
+      assert.equal(fs.existsSync(lockFilePath), false);
+    });
+
+    it('should release lock synchronously with releaseSync', async () => {
+      const lock = new ProcessLock(lockFilePath);
+      await lock.acquire();
+      assert.equal(lock.isLocked, true);
+      assert.equal(fs.existsSync(lockFilePath), true);
+
+      lock.releaseSync();
+      assert.equal(lock.isLocked, false);
+      assert.equal(fs.existsSync(lockFilePath), false);
     });
   });
 });

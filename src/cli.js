@@ -28,6 +28,10 @@ import {
   sendFailureAlert,
   sendTestNotification,
 } from './notifier.js';
+import {
+  ProcessLock,
+  DEFAULT_LOCK_FILENAME,
+} from './lock.js';
 
 /**
  * CLI Version string.
@@ -157,6 +161,8 @@ export async function backupCommand(options = {}, context = {}) {
     io = console,
     fetch: customFetch,
     s3Client,
+    lockFilePath: customLockFilePath,
+    processLock: customProcessLock,
   } = context;
 
   const config = customConfig || loadConfig(env);
@@ -170,8 +176,17 @@ export async function backupCommand(options = {}, context = {}) {
 
   let stagingDir = null;
   let archivePath = null;
+  let lockAcquired = false;
+
+  const lockFilePath = customLockFilePath || path.join(config.tempDir, DEFAULT_LOCK_FILENAME);
+  const processLock = customProcessLock || new ProcessLock(lockFilePath);
 
   try {
+    // Acquire concurrency process lock prior to execution
+    await processLock.acquire();
+    lockAcquired = true;
+    logVerbose(`[INFO] Acquired process lock: ${lockFilePath} (PID: ${process.pid})`);
+
     // Validate configuration
     validateConfig(config, {
       requireR2: !dryRun,
@@ -384,6 +399,15 @@ export async function backupCommand(options = {}, context = {}) {
       exitCode: 1,
       error: sanitizedError,
     };
+  } finally {
+    if (lockAcquired) {
+      try {
+        await processLock.release();
+        logVerbose(`[INFO] Released process lock: ${lockFilePath}`);
+      } catch (releaseErr) {
+        logVerbose(`[WARN] Failed to release process lock: ${releaseErr.message}`);
+      }
+    }
   }
 }
 
